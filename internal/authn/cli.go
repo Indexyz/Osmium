@@ -5,7 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
-	"html/template"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -79,26 +79,36 @@ func parseCLIParams(get func(string) string) (cliParams, bool) {
 	return p, true
 }
 
-var cliPage = template.Must(template.New("cli").Parse(`<!doctype html>
+const cliPageHead = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>授权 osmium CLI</title>
 <style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.6}
 button{font-size:1rem;padding:.5rem 1.2rem}code{background:#eee;padding:0 .3em}</style></head>
 <body>
 <h1>授权 osmium CLI</h1>
-{{if .User}}
-<p>本机的 osmium CLI 请求以 <strong>{{.User}}</strong> 的身份登录。只有在你刚刚运行了 <code>osmium login</code> 时才应该授权。</p>
-<form method="post" action="/auth/cli">
-<input type="hidden" name="csrf" value="{{.CSRF}}">
-<input type="hidden" name="port" value="{{.Port}}">
-<input type="hidden" name="state" value="{{.State}}">
-<input type="hidden" name="code_challenge" value="{{.Challenge}}">
-<button type="submit">授权</button>
-</form>
-{{else}}
-<p>{{.Message}}</p>
-{{end}}
-</body></html>`))
+`
+
+const cliPageTail = `</body></html>`
+
+// The page is assembled by hand rather than with html/template: the template
+// engine looks methods up by name via reflection, which stops the linker
+// from pruning unused methods and costs about 2 MiB of binary size. Every
+// dynamic value goes through html.EscapeString.
+func writeCLIPage(w io.Writer, body string) {
+	_, _ = io.WriteString(w, cliPageHead+body+cliPageTail)
+}
+
+func cliMessage(msg string) string { return "<p>" + html.EscapeString(msg) + "</p>\n" }
+
+func cliConfirm(user, csrf string, p cliParams) string {
+	input := func(name, value string) string {
+		return `<input type="hidden" name="` + name + `" value="` + html.EscapeString(value) + `">` + "\n"
+	}
+	return "<p>本机的 osmium CLI 请求以 <strong>" + html.EscapeString(user) + "</strong> 的身份登录。只有在你刚刚运行了 <code>osmium login</code> 时才应该授权。</p>\n" +
+		`<form method="post" action="/auth/cli">` + "\n" +
+		input("csrf", csrf) + input("port", strconv.Itoa(p.Port)) + input("state", p.State) + input("code_challenge", p.Challenge) +
+		`<button type="submit">授权</button>` + "\n</form>\n"
+}
 
 // HandleCLIAuthorize shows the confirmation page (GET /auth/cli).
 func (a *Authenticator) HandleCLIAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +117,7 @@ func (a *Authenticator) HandleCLIAuthorize(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
-		_ = cliPage.Execute(w, map[string]any{"Message": "无效的 CLI 登录请求，请重新运行 osmium login。"})
+		writeCLIPage(w, cliMessage("无效的 CLI 登录请求，请重新运行 osmium login。"))
 		return
 	}
 	s, ok := a.Lookup(r)
@@ -117,14 +127,14 @@ func (a *Authenticator) HandleCLIAuthorize(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		w.WriteHeader(http.StatusUnauthorized)
-		_ = cliPage.Execute(w, map[string]any{"Message": "请先在此浏览器中登录 Web 界面，然后重新运行 osmium login。"})
+		writeCLIPage(w, cliMessage("请先在此浏览器中登录 Web 界面，然后重新运行 osmium login。"))
 		return
 	}
 	name := s.User.DisplayName
 	if name == "" {
 		name = s.User.ID
 	}
-	_ = cliPage.Execute(w, map[string]any{"User": name, "CSRF": s.CSRF, "Port": p.Port, "State": p.State, "Challenge": p.Challenge})
+	writeCLIPage(w, cliConfirm(name, s.CSRF, p))
 }
 
 // HandleCLIApprove issues a one-time code (POST /auth/cli). The caller must

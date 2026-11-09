@@ -7,7 +7,7 @@ Web SSH 访问系统：用户通过 OIDC 登录，可以在浏览器终端里连
 ## 快速开始
 
 ```sh
-go build -o osmium ./cmd/osmium
+make build   # 发布构建，约 9.4 MiB，见 docs/development.md
 
 # Server 与主机 Agent
 osmium server -c server.json
