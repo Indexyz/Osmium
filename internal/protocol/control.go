@@ -11,8 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"time"
+
+	"github.com/indexyz/osmium/internal/tunnel"
 )
 
 // WebSocket subprotocols.
@@ -38,7 +39,8 @@ const (
 	TypeClosed    = "session.closed"
 )
 
-var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+// validID is shared with the stream prelude so both channels accept the same IDs.
+var validID = tunnel.ValidID
 
 // Envelope is the common control message wrapper.
 type Envelope struct {
@@ -126,7 +128,7 @@ func Decode(b []byte) (string, any, error) {
 	if err := strictDecode(b, &env); err != nil {
 		return "", nil, fmt.Errorf("invalid envelope: %w", err)
 	}
-	if env.Version != 1 || !validID.MatchString(env.MessageID) || len(env.Payload) == 0 {
+	if env.Version != 1 || !validID(env.MessageID) || len(env.Payload) == 0 {
 		return "", nil, errors.New("invalid envelope fields")
 	}
 	var p any
@@ -182,22 +184,22 @@ func validatePayload(typ string, p any) error {
 			}
 		}
 	case Welcome:
-		if typ != TypeWelcome || !validID.MatchString(v.AgentID) || !validID.MatchString(v.HostID) || v.Epoch == 0 ||
-			!validID.MatchString(v.DataTunnelID) || v.DataPath != DataPath || len(v.DataTicket) < 16 || len(v.DataTicket) > 2048 ||
+		if typ != TypeWelcome || !validID(v.AgentID) || !validID(v.HostID) || v.Epoch == 0 ||
+			!validID(v.DataTunnelID) || v.DataPath != DataPath || len(v.DataTicket) < 16 || len(v.DataTicket) > 2048 ||
 			v.ExpiresAt.IsZero() || v.SmuxVersion != 2 {
 			return bad("fields")
 		}
 	case Heartbeat:
-		if typ != TypeHeartbeat || v.Epoch == 0 || !validID.MatchString(v.DataTunnelID) || v.ActiveStreams < 0 {
+		if typ != TypeHeartbeat || v.Epoch == 0 || !validID(v.DataTunnelID) || v.ActiveStreams < 0 {
 			return bad("fields")
 		}
 	case DataReady:
-		if typ != TypeDataReady || v.Epoch == 0 || !validID.MatchString(v.DataTunnelID) {
+		if typ != TypeDataReady || v.Epoch == 0 || !validID(v.DataTunnelID) {
 			return bad("fields")
 		}
 	case SessionClose:
-		if (typ != TypeClose && typ != TypeClosed) || v.Epoch == 0 || !validID.MatchString(v.SessionID) ||
-			!validID.MatchString(v.AttemptID) || len(v.Reason) > 256 {
+		if (typ != TypeClose && typ != TypeClosed) || v.Epoch == 0 || !validID(v.SessionID) ||
+			!validID(v.AttemptID) || len(v.Reason) > 256 {
 			return bad("fields")
 		}
 	default:

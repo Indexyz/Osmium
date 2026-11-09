@@ -52,8 +52,11 @@ osmium dev pki -o dev/pki --server-hosts localhost,127.0.0.1 --agents agent-123
 
 ```sh
 osmium server -c /etc/osmium/server.json   # 参考 examples/server.example.json
-osmium agent  -c /etc/osmium-agent/agent.json   # 参考 examples/agent.example.json
+osmium-agent -c /etc/osmium-agent/agent.json  # 目标主机上运行，参考 examples/agent.example.json
 ```
+
+- 目标主机上应部署独立构建的 `osmium-agent`（`make agent`，交叉编译用 `make agent GOOS=linux GOARCH=arm64`）。它只包含 Agent 所需的代码，体积和内存占用都更小，适合性能和内存都有限的边缘设备。主程序里的 `osmium agent` 与它功能相同。
+- 内存非常紧张的设备上，可以在 systemd unit 中设置 `Environment=GOMEMLIMIT=24MiB`，让 GC 在接近这个上限时更积极地回收。也可以在 `agent.json` 的 `smux` 中调小 `max_receive_buffer`（默认 4 MiB）和 `max_stream_buffer`（默认 256 KiB），以限制隧道缓冲。注意 smux 参数必须与 Server 配置完全一致。
 
 - Server 的 Web 监听（`listen`）建议放在 HTTPS 反向代理之后，或直接配置 `tls_cert` / `tls_key`。
 - `public_url` 必须是浏览器实际访问的地址，用于 Origin 校验。

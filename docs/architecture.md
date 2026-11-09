@@ -44,7 +44,8 @@ osmium CLI + ssh ───┘          ▲
 
 | 路径 | 内容 |
 | --- | --- |
-| `cmd/osmium` | 唯一的可执行文件（cobra）：`server`、`agent`、`login`、`hosts`、`ssh`、`dev pki` 等 |
+| `cmd/osmium` | 主程序（cobra）：`server`、`agent`、`login`、`hosts`、`ssh`、`dev pki` 等 |
+| `cmd/osmium-agent` | 目标主机上的独立 Agent，依赖最少，面向边缘设备 |
 | `internal/tunnel` | smux 传输层、prelude 编解码、Agent 端 stream 处理 |
 | `internal/protocol` | control、终端和原生隧道消息 |
 | `internal/agenthub` | Agent 注册、epoch、data ticket 和 stream 分配 |

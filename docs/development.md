@@ -4,7 +4,8 @@
 
 ```sh
 make build                        # 发布构建，输出 ./osmium
-make size                         # 构建并打印体积
+make agent                        # 独立 Agent，输出 ./osmium-agent（可加 GOOS/GOARCH/GOARM 交叉编译）
+make size                         # 构建两者并打印体积
 go build -o osmium ./cmd/osmium   # 调试构建（保留符号表，体积大）
 ./osmium --help
 ```
@@ -24,6 +25,14 @@ linux/amd64、Go 1.26 下的参考数据：
 | `go build`（默认） | 约 13.7 MiB |
 | `make build`（`-trimpath -s -w`） | 约 9.4 MiB |
 | 再用 `upx --best --lzma` 压缩（可选，默认不做） | 约 3.0 MiB |
+| `make agent`（独立 Agent） | amd64 约 6.5 MiB，arm64 约 6.1 MiB，armv7 约 6.4 MiB |
+
+**独立 Agent（`cmd/osmium-agent`）是对体积要求最严格的产物**，它运行在性能差、内存小的边缘设备上。约束如下：
+
+- 只依赖 `internal/agent`、`internal/tunnel`、`internal/protocol`、`internal/config`，不要引入 cobra、Server、CLI、OIDC、SSH 客户端或模板相关的包。命令行参数用标准库 `flag` 解析。
+- 这几个包里不要用 `regexp`，ID 和错误码的校验都是手写的（见 `tunnel.ValidID`）。
+- 剩下的体积主要来自 Go 运行时、TLS，以及 websocket 库所需的 `net/http`。空闲时常驻内存约 7.5 MiB（amd64）。
+- 修改上述包后，运行 `make size` 对比体积，并用 `go list -deps ./cmd/osmium-agent` 确认没有引入新的依赖。
 
 - `-s -w` 去掉符号表和 DWARF。`.gopclntab` 会保留，panic 时仍有栈回溯。
 - **不要在程序中使用 `text/template` 或 `html/template`**，cobra 自带的帮助模板不受影响。模板引擎通过反射按名字查找方法，导致链接器必须保留所有可达类型的导出方法，体积会增加约 2 MiB。出于同样的原因，CLI 授权页用手写 HTML 生成，所有动态值都经过 `html.EscapeString` 转义。`reflect.Value.MethodByName` 也有同样的问题，应当避免。

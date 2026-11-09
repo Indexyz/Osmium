@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -122,5 +123,25 @@ func (stalledWriter) Write([]byte) (int, error) { return 0, nil }
 func TestZeroProgressWrite(t *testing.T) {
 	if err := writeFull(stalledWriter{}, []byte("x")); err != io.ErrShortWrite {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestValidIDAndCode(t *testing.T) {
+	long := strings.Repeat("a", 128)
+	for s, want := range map[string]bool{
+		"host-123": true, "a.b_c-D9": true, long: true,
+		"": false, long + "a": false, "a b": false, "a/b": false, "a\n": false, "é": false, "a:b": false,
+	} {
+		if got := ValidID(s); got != want {
+			t.Errorf("ValidID(%q) = %v, want %v", s, got, want)
+		}
+	}
+	for s, want := range map[string]bool{
+		"HOST_MISMATCH": true, strings.Repeat("A", 64): true,
+		"": false, strings.Repeat("A", 65): false, "lower": false, "A-B": false, "A1": false,
+	} {
+		if got := validCode(s); got != want {
+			t.Errorf("validCode(%q) = %v, want %v", s, got, want)
+		}
 	}
 }

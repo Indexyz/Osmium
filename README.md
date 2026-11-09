@@ -7,11 +7,11 @@ Web SSH 访问系统：用户通过 OIDC 登录，可以在浏览器终端里连
 ## 快速开始
 
 ```sh
-make build   # 发布构建，约 9.4 MiB，见 docs/development.md
+make build   # Server + CLI，约 9.4 MiB
+make agent   # 目标主机上的独立 Agent，约 6.5 MiB；交叉编译：make agent GOARCH=arm64
 
-# Server 与主机 Agent
 osmium server -c server.json
-osmium agent  -c agent.json
+osmium-agent  -c agent.json   # 在目标主机上运行
 
 # 用户：本机 OpenSSH + ssh-agent
 osmium login --server https://ssh.example.com

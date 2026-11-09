@@ -2,12 +2,17 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GOFLAGS_RELEASE = -trimpath -ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: build test size
+.PHONY: build agent test size
 build:
 	CGO_ENABLED=0 go build $(GOFLAGS_RELEASE) -o osmium ./cmd/osmium
+
+# 目标主机（边缘设备）上的独立 Agent：不含 Server、CLI、cobra。
+# 交叉编译示例：make agent GOOS=linux GOARCH=arm64
+agent:
+	CGO_ENABLED=0 go build $(GOFLAGS_RELEASE) -o osmium-agent ./cmd/osmium-agent
 
 test:
 	go test -race ./...
 
-size: build
-	@ls -l osmium | awk '{printf "osmium: %.2f MiB\n", $$5/1048576}'
+size: build agent
+	@ls -l osmium osmium-agent | awk '{printf "%-14s %.2f MiB\n", $$9, $$5/1048576}'

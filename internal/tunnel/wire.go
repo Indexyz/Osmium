@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 )
 
 // MaxPrelude bounds the JSON prelude exchanged once at the start of a stream.
@@ -29,10 +28,21 @@ const (
 	CodeCancelled        = "CANCELLED"
 )
 
-var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
-
-// ValidID reports whether s is a safe opaque identifier.
-func ValidID(s string) bool { return validID.MatchString(s) }
+// ValidID reports whether s is a safe opaque identifier: 1-128 characters
+// from [A-Za-z0-9._-]. Hand-written instead of regexp to keep the Agent
+// binary small.
+func ValidID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
 
 // Binding is obtained from authenticated registration, never from the stream.
 type Binding struct {
@@ -77,7 +87,7 @@ func (r OpenRequest) Validate(b Binding) error {
 		return coded(CodeInvalidOpen, "invalid open version, type or epoch")
 	}
 	for _, id := range []string{r.HostID, r.SessionID, r.AttemptID} {
-		if !validID.MatchString(id) {
+		if !ValidID(id) {
 			return coded(CodeInvalidOpen, "invalid identifier")
 		}
 	}
@@ -100,14 +110,25 @@ type OpenResult struct {
 	Code      string `json:"code,omitempty"`
 }
 
-var validCode = regexp.MustCompile(`^[A-Z_]{1,64}$`)
+// validCode reports whether s matches ^[A-Z_]{1,64}$.
+func validCode(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !(c >= 'A' && c <= 'Z' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
 
 // Validate checks that the ack correlates with q and is self-consistent.
 func (r OpenResult) Validate(q OpenRequest) error {
 	if r.Version != 1 || r.Type != "ssh.open_result" || r.SessionID != q.SessionID || r.AttemptID != q.AttemptID {
 		return errors.New("mismatched open result")
 	}
-	if r.OK && r.Code != "" || !r.OK && !validCode.MatchString(r.Code) {
+	if r.OK && r.Code != "" || !r.OK && !validCode(r.Code) {
 		return errors.New("inconsistent open result")
 	}
 	return nil
