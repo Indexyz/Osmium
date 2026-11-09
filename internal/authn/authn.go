@@ -83,11 +83,14 @@ type Authenticator struct {
 	mu       sync.Mutex
 	sessions map[string]*WebSession // key: sha256(cookie)
 	pending  map[string]pendingLogin
+
+	cliCodes  map[string]cliCode   // key: sha256(code)
+	cliTokens map[string]*CLIToken // key: sha256(token)
 }
 
 type pendingLogin struct {
-	nonce, verifier, browserBinding string
-	expires                         time.Time
+	nonce, verifier, browserBinding, next string
+	expires                               time.Time
 }
 
 // New creates the authenticator, discovering the OIDC provider if set.
@@ -95,7 +98,7 @@ func New(ctx context.Context, cfg Config, a *audit.Logger, log *slog.Logger) (*A
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 8 * time.Hour
 	}
-	au := &Authenticator{cfg: cfg, audit: a, log: log, sessions: map[string]*WebSession{}, pending: map[string]pendingLogin{}}
+	au := &Authenticator{cfg: cfg, audit: a, log: log, sessions: map[string]*WebSession{}, pending: map[string]pendingLogin{}, cliCodes: map[string]cliCode{}, cliTokens: map[string]*CLIToken{}}
 	if cfg.OIDC == nil && !cfg.DevLogin {
 		return nil, errors.New("authn: configure oidc (or dev_login for local development)")
 	}
@@ -190,7 +193,7 @@ func (a *Authenticator) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many pending logins", http.StatusServiceUnavailable)
 		return
 	}
-	a.pending[state] = pendingLogin{nonce: nonce, verifier: verifier, browserBinding: binding, expires: now.Add(10 * time.Minute)}
+	a.pending[state] = pendingLogin{nonce: nonce, verifier: verifier, browserBinding: binding, next: SafeNext(r.URL.Query().Get("next")), expires: now.Add(10 * time.Minute)}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: stateCookie, Value: binding, Path: "/auth/", HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
@@ -258,7 +261,7 @@ func (a *Authenticator) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.startSession(w, u)
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, p.next, http.StatusFound)
 }
 
 // HandleDevLogin creates a session for a named local user. Development only.
@@ -279,7 +282,7 @@ func (a *Authenticator) HandleDevLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.startSession(w, User{ID: UserID("dev", name), Issuer: "dev", Subject: name, DisplayName: name + " (dev)", Groups: groups})
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, SafeNext(r.URL.Query().Get("next")), http.StatusFound)
 }
 
 // HandleLogout ends the Web session (CSRF protected).

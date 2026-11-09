@@ -47,6 +47,12 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("GET /auth/callback", s.Auth.HandleCallback)
 	mux.HandleFunc("GET /auth/dev-login", s.Auth.HandleDevLogin)
 	mux.HandleFunc("POST /auth/logout", s.Auth.HandleLogout)
+	mux.HandleFunc("GET /auth/cli", s.Auth.HandleCLIAuthorize)
+	mux.HandleFunc("POST /auth/cli", s.sameOrigin(s.Auth.HandleCLIApprove))
+	mux.HandleFunc("POST /auth/cli/token", s.Auth.HandleCLIToken)
+	mux.HandleFunc("POST /api/v1/cli/logout", s.authed(s.cliLogout))
+	mux.HandleFunc("POST /api/v1/native-sessions", s.authed(s.csrf(s.createNative)))
+	mux.HandleFunc("GET /api/v1/ssh-sessions/{session_id}/tunnel", s.authed(s.nativeTunnel))
 	mux.HandleFunc("GET /api/v1/me", s.authed(s.me))
 	mux.HandleFunc("GET /api/v1/hosts", s.authed(s.listHosts))
 	mux.HandleFunc("GET /api/v1/ssh-sessions", s.authed(s.listSessions))
@@ -78,7 +84,9 @@ func securityHeaders(h http.Handler) http.Handler {
 type ctxKey struct{}
 
 type reqCtx struct {
-	web     *authn.WebSession
+	web     *authn.WebSession // nil for CLI Bearer requests
+	user    authn.User
+	bearer  bool
 	subject authz.Subject
 	id      string
 }
@@ -110,19 +118,47 @@ func (s *Server) authed(h func(http.ResponseWriter, *http.Request, *reqCtx)) htt
 	return func(w http.ResponseWriter, r *http.Request) {
 		rc := &reqCtx{id: requestID()}
 		r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, rc))
-		ws, ok := s.Auth.Lookup(r)
-		if !ok {
-			writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "login required")
-			return
+		// A request carrying a Bearer token is authenticated by that token
+		// only; it never falls back to the ambient cookie.
+		if authn.HasBearer(r) {
+			t, ok := s.Auth.LookupBearer(r)
+			if !ok {
+				writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "invalid or expired token")
+				return
+			}
+			rc.user, rc.bearer = t.User, true
+		} else {
+			ws, ok := s.Auth.Lookup(r)
+			if !ok {
+				writeError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "login required")
+				return
+			}
+			rc.web, rc.user = ws, ws.User
 		}
-		rc.web = ws
-		rc.subject = authn.Subject(ws.User, s.Store.Current())
+		rc.subject = authn.Subject(rc.user, s.Store.Current())
 		h(w, r, rc)
 	}
 }
 
+// sameOrigin requires an Origin header matching the public origin.
+func (s *Server) sameOrigin(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.originAllowed(r, false) {
+			writeError(w, r, http.StatusForbidden, "ORIGIN", "origin not allowed")
+			return
+		}
+		h(w, r)
+	}
+}
+
+// csrf protects cookie-authenticated writes. Bearer requests are exempt: the
+// token is never sent ambiently by a browser.
 func (s *Server) csrf(h func(http.ResponseWriter, *http.Request, *reqCtx)) func(http.ResponseWriter, *http.Request, *reqCtx) {
 	return func(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+		if rc.bearer {
+			h(w, r, rc)
+			return
+		}
 		if !authn.CheckCSRF(r, rc.web) || !s.originAllowed(r, true) {
 			writeError(w, r, http.StatusForbidden, "CSRF", "missing or invalid CSRF token")
 			return
@@ -145,11 +181,11 @@ func (s *Server) originAllowed(r *http.Request, optional bool) bool {
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user":       rc.web.User,
-		"is_admin":   rc.subject.IsAdmin,
-		"csrf_token": rc.web.CSRF,
-	})
+	out := map[string]any{"user": rc.user, "is_admin": rc.subject.IsAdmin}
+	if rc.web != nil {
+		out["csrf_token"] = rc.web.CSRF
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type hostView struct {
@@ -328,7 +364,7 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 	id := r.PathValue("session_id")
 	sess, err := s.Sessions.Get(rc.subject, id)
 	// Only the owner may attach; administrators may close but not watch.
-	if err != nil || sess.Subject.UserID != rc.subject.UserID {
+	if err != nil || sess.Subject.UserID != rc.subject.UserID || sess.Mode != sessions.ModeWeb || rc.bearer {
 		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "not found")
 		return
 	}

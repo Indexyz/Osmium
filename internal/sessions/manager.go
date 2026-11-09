@@ -109,7 +109,9 @@ type Session struct {
 	HostID    string
 	Login     string
 	CreatedAt time.Time
+	Mode      string // ModeWeb or ModeNative
 
+	clientKey      ssh.PublicKey // native only: the CLI's ephemeral public key
 	mu             sync.Mutex
 	state          string
 	stateVersion   uint64
@@ -133,9 +135,11 @@ type View struct {
 	ID         string    `json:"id"`
 	HostID     string    `json:"host_id"`
 	LoginUser  string    `json:"login_user"`
+	Mode       string    `json:"mode"`
 	State      string    `json:"state"`
 	CreatedAt  time.Time `json:"created_at"`
-	TermPath   string    `json:"terminal_path"`
+	TermPath   string    `json:"terminal_path,omitempty"`
+	TunnelPath string    `json:"tunnel_path,omitempty"`
 	EndReason  *string   `json:"end_reason"`
 	UserID     string    `json:"-"`
 	Attempt    *Attempt  `json:"-"`
@@ -147,8 +151,13 @@ type View struct {
 func (s *Session) View() View {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v := View{ID: s.ID, HostID: s.HostID, LoginUser: s.Login, State: s.state, CreatedAt: s.CreatedAt,
-		TermPath: "/api/v1/ssh-sessions/" + s.ID + "/terminal", UserID: s.Subject.UserID, Version: s.stateVersion, ActivateAt: s.activatedAt}
+	v := View{ID: s.ID, HostID: s.HostID, LoginUser: s.Login, Mode: s.Mode, State: s.state, CreatedAt: s.CreatedAt,
+		UserID: s.Subject.UserID, Version: s.stateVersion, ActivateAt: s.activatedAt}
+	if s.Mode == ModeNative {
+		v.TunnelPath = "/api/v1/ssh-sessions/" + s.ID + "/tunnel"
+	} else {
+		v.TermPath = "/api/v1/ssh-sessions/" + s.ID + "/terminal"
+	}
 	if s.endReason != "" {
 		r := s.endReason
 		v.EndReason = &r
@@ -230,6 +239,7 @@ type Manager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	idem     map[string]idemEntry
+	seenKeys map[string]time.Time // native client key fingerprints (one key per attempt)
 }
 
 type idemEntry struct {
@@ -241,7 +251,7 @@ type idemEntry struct {
 // NewManager creates a Manager and subscribes it to policy changes.
 func NewManager(cfg Config, store *authz.Store, hub Opener, signer ca.Signer, a *audit.Logger, log *slog.Logger) *Manager {
 	cfg.defaults()
-	m := &Manager{cfg: cfg, store: store, hub: hub, signer: signer, audit: a, log: log, sessions: map[string]*Session{}, idem: map[string]idemEntry{}}
+	m := &Manager{cfg: cfg, store: store, hub: hub, signer: signer, audit: a, log: log, sessions: map[string]*Session{}, idem: map[string]idemEntry{}, seenKeys: map[string]time.Time{}}
 	store.OnChange(m.onPolicyChange)
 	return m
 }
@@ -281,15 +291,26 @@ func (m *Manager) Create(u authz.Subject, r CreateRequest) (*Session, bool, erro
 		}
 		return nil, false, ErrConflict
 	}
-	snap := m.store.Current()
-	d := snap.Check(u, r.HostID, r.Login)
-	if !d.Allowed {
-		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "denied", Target: r.HostID + "/" + r.Login, Revision: d.Revision, Reason: d.Reason})
-		return nil, false, ErrForbidden
+	s, err := m.admitLocked(u, r.HostID, r.Login, ModeWeb)
+	if err != nil {
+		return nil, false, err
 	}
-	host, _ := snap.Host(r.HostID)
+	s.rows, s.cols = r.Rows, r.Cols
+	m.idem[idemKey] = idemEntry{bodyHash: r.BodyHash, sessionID: s.ID, expires: time.Now().Add(24 * time.Hour)}
+	return s, true, nil
+}
+
+// admitLocked authorizes and registers a new session. m.mu must be held.
+func (m *Manager) admitLocked(u authz.Subject, hostID, login, mode string) (*Session, error) {
+	snap := m.store.Current()
+	d := snap.Check(u, hostID, login)
+	if !d.Allowed {
+		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "denied", Target: hostID + "/" + login, Revision: d.Revision, Reason: d.Reason, Extra: map[string]any{"mode": mode}})
+		return nil, ErrForbidden
+	}
+	host, _ := snap.Host(hostID)
 	if m.hub.Status(host) != "ready" {
-		return nil, false, ErrUnavailable
+		return nil, ErrUnavailable
 	}
 	perUser, total := 0, 0
 	for _, s := range m.sessions {
@@ -302,14 +323,13 @@ func (m *Manager) Create(u authz.Subject, r CreateRequest) (*Session, bool, erro
 		}
 	}
 	if perUser >= m.cfg.MaxPerUser || total >= m.cfg.MaxTotal {
-		return nil, false, ErrLimitReached
+		return nil, ErrLimitReached
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
-	s := &Session{ID: newID("s-"), Subject: u, HostID: r.HostID, Login: r.Login, CreatedAt: time.Now().UTC(),
-		state: StateCreated, policyRevision: d.Revision, rows: r.Rows, cols: r.Cols, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	s := &Session{ID: newID("s-"), Subject: u, HostID: hostID, Login: login, CreatedAt: time.Now().UTC(), Mode: mode,
+		state: StateCreated, policyRevision: d.Revision, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	m.sessions[s.ID] = s
-	m.idem[idemKey] = idemEntry{bodyHash: r.BodyHash, sessionID: s.ID, expires: time.Now().Add(24 * time.Hour)}
-	m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "ok", Target: r.HostID + "/" + r.Login, SessionID: s.ID, Revision: d.Revision})
+	m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "ok", Target: hostID + "/" + login, SessionID: s.ID, Revision: d.Revision, Extra: map[string]any{"mode": mode}})
 	time.AfterFunc(m.cfg.AttachTimeout, func() {
 		s.mu.Lock()
 		attached := s.attached
@@ -318,7 +338,7 @@ func (m *Manager) Create(u authz.Subject, r CreateRequest) (*Session, bool, erro
 			m.terminate(s, StateFailed, "attach_timeout")
 		}
 	})
-	return s, true, nil
+	return s, nil
 }
 
 func (m *Manager) gcLocked() {
@@ -326,6 +346,11 @@ func (m *Manager) gcLocked() {
 	for k, e := range m.idem {
 		if now.After(e.expires) {
 			delete(m.idem, k)
+		}
+	}
+	for fp, t := range m.seenKeys {
+		if now.Sub(t) > keyReuseWindow {
+			delete(m.seenKeys, fp)
 		}
 	}
 	for id, s := range m.sessions {
@@ -438,6 +463,9 @@ type Terminal interface {
 // Attach binds the single terminal consumer and runs the connection pipeline
 // until the session ends. It returns ErrConflict if already attached.
 func (m *Manager) Attach(s *Session, t Terminal) error {
+	if s.Mode != ModeWeb {
+		return ErrConflict
+	}
 	s.mu.Lock()
 	if s.attached || s.state != StateCreated {
 		s.mu.Unlock()

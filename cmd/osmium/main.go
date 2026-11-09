@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,23 +21,28 @@ func newLogger() *slog.Logger {
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "osmium",
-		Short:         "Web SSH 访问系统：Server、主机 Agent 与开发工具",
+		Short:         "Web SSH 访问系统：Server、主机 Agent、CLI 客户端与开发工具",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newServerCmd(), newAgentCmd(), newDevCmd(), &cobra.Command{
-		Use:   "version",
-		Short: "打印版本",
-		Args:  cobra.NoArgs,
-		Run:   func(cmd *cobra.Command, _ []string) { fmt.Fprintln(cmd.OutOrStdout(), version) },
-	})
+	root.AddCommand(newServerCmd(), newAgentCmd(), newDevCmd(),
+		newLoginCmd(), newLogoutCmd(), newHostsCmd(), newSSHCmd(), newProxyConnectCmd(), &cobra.Command{
+			Use:   "version",
+			Short: "打印版本",
+			Args:  cobra.NoArgs,
+			Run:   func(cmd *cobra.Command, _ []string) { fmt.Fprintln(cmd.OutOrStdout(), version) },
+		})
 	return root
 }
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
-		newLogger().Error("osmium exited", "err", err)
+		var code exitCodeError
+		if errors.As(err, &code) {
+			os.Exit(int(code))
+		}
+		fmt.Fprintln(os.Stderr, "osmium:", err)
 		os.Exit(1)
 	}
 }
