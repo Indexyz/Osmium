@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "status": "design-example-not-a-loaded-runtime-config",
+  "agent": {
+    "control_path": "/agent/v1/control",
+    "data_path": "/agent/v1/data",
+    "ssh_target": "127.0.0.1:22",
+    "max_concurrent_streams": 32
+  },
+  "smux": {
+    "version": 2,
+    "keepalive_interval": "10s",
+    "keepalive_timeout": "30s",
+    "max_frame_size": 16384,
+    "max_receive_buffer": 4194304,
+    "max_stream_buffer": 262144
+  },
+  "timeouts": {
+    "tunnel_ticket": "30s",
+    "stream_open": "10s",
+    "tcp_dial": "5s",
+    "relay_drain": "5s"
+  },
+  "notes": [
+    "参数为实验起点，非生产容量承诺",
+    "证书有效期不作为数据WSS或SSH会话deadline",
+    "控制/数据两个WSS；一个SSH transport一个stream"
+  ]
+}

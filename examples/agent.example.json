@@ -1,0 +1,15 @@
+{
+  "server_url": "wss://ssh.example.com:8443",
+  "server_ca": "/etc/osmium-agent/agent-ca.crt",
+  "server_name": "ssh.example.com",
+  "client_cert": "/etc/osmium-agent/agent-123.crt",
+  "client_key": "/etc/osmium-agent/agent-123.key",
+  "ssh_target": "127.0.0.1:22",
+  "reported_labels": {"os": "linux"},
+  "max_concurrent_streams": 32,
+  "heartbeat_interval": "15s",
+  "stream_open_timeout": "10s",
+  "tcp_dial_timeout": "5s",
+  "relay_drain_timeout": "5s",
+  "reconnect_max_backoff": "30s"
+}

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Osmium Web SSH</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <strong>Osmium</strong>
+  <span id="who"></span>
+  <button id="logout" hidden>退出登录</button>
+</header>
+
+<main>
+  <section id="login" hidden>
+    <h2>登录</h2>
+    <p><a id="oidc-login" href="/auth/login">使用 OIDC 登录</a></p>
+  </section>
+
+  <section id="hosts" hidden>
+    <div class="toolbar">
+      <input id="filter" placeholder="label 过滤，例如 env=prod role=web" size="40">
+      <button id="refresh">刷新</button>
+    </div>
+    <table>
+      <thead><tr><th>主机</th><th>状态</th><th>Labels</th><th>登录账号</th><th></th></tr></thead>
+      <tbody id="host-rows"></tbody>
+    </table>
+    <p id="hosts-empty" class="muted" hidden>没有可见的主机。</p>
+  </section>
+
+  <section id="term-view" hidden>
+    <div class="toolbar">
+      <span id="term-title"></span>
+      <span id="term-state" class="state"></span>
+      <button id="term-close">断开</button>
+      <button id="term-back" hidden>返回主机列表</button>
+    </div>
+    <div id="terminal"></div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

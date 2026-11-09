@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "type": "ssh.open",
+  "host_id": "host-123",
+  "session_id": "s789",
+  "attempt_id": "a001",
+  "connection_epoch": 7
+}

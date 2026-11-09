@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "type": "agent.welcome",
+  "message_id": "m-002",
+  "payload": {
+    "agent_id": "agent-123",
+    "host_id": "host-123",
+    "connection_epoch": 7,
+    "data_tunnel_id": "dt-007",
+    "data_path": "/agent/v1/data",
+    "data_ticket": "example-only-not-a-real-ticket",
+    "expires_at": "2026-11-09T16:00:30Z",
+    "smux_version": 2
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "host_id": "host-123",
+  "login_user": "ops",
+  "terminal": {
+    "rows": 40,
+    "cols": 120
+  }
+}

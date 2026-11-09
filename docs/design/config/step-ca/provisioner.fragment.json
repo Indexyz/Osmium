@@ -1,0 +1,16 @@
+{
+  "claims": {
+    "enableSSHCA": true,
+    "minUserSSHCertDuration": "1m",
+    "defaultUserSSHCertDuration": "1m",
+    "maxUserSSHCertDuration": "1m"
+  },
+  "options": {
+    "ssh": {
+      "templateFile": "templates/ssh/web-user.tpl"
+    },
+    "x509": {
+      "templateFile": "templates/x509/deny.tpl"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "type": "terminal.resize",
+  "payload": {
+    "rows": 40,
+    "cols": 120
+  }
+}

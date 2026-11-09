@@ -1,0 +1,19 @@
+stateDiagram-v2
+  [*] --> created
+  created --> waiting_agent: 浏览器绑定且权限通过
+  waiting_agent --> signing: smux stream open/ack成功且重查权限
+  signing --> ssh_authenticating: 证书验证通过
+  ssh_authenticating --> active: 认证与激活检查通过
+  active --> closing: 正常结束或关闭请求
+  created --> closing: 取消
+  waiting_agent --> closing: 取消
+  signing --> closing: 撤权或取消
+  ssh_authenticating --> closing: 撤权或取消
+  closing --> closed: 资源清理完成
+  created --> failed: 错误
+  waiting_agent --> failed: 超时或错误
+  signing --> failed: CA错误
+  ssh_authenticating --> failed: 身份或认证错误
+  active --> failed: 不可恢复断线
+  closed --> [*]
+  failed --> [*]

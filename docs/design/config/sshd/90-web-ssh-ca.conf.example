@@ -1,0 +1,9 @@
+# Example fragment ONLY; merge/review against actual sshd configuration.
+# Confirm Include support and the effective first-value / Match behavior.
+# Files are public trust metadata, NOT private keys.
+PubkeyAuthentication yes
+TrustedUserCAKeys /etc/ssh/user_ca.pub
+AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u
+
+# This fragment does NOT disable password, authorized_keys, other CAs or root.
+# Do not globally remove emergency access. See config/README.md.

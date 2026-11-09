@@ -1,0 +1,15 @@
+flowchart LR
+ B["浏览器：主机列表 / Web 终端"]
+ I["OIDC Provider"]
+ S["Go Server / SSH Gateway：授权 + SSH client"]
+ C["step-ca：专用签发授权"]
+ A["Go Agent：smux accept + 固定本机转发"]
+ H["本机 sshd：User CA + 目标 principal"]
+ B <-->|"OIDC 登录"| I
+ B <-->|"HTTPS / 终端 WSS"| S
+ S <-->|"公钥 + JWK OTT / 约 60 秒用户证书"| C
+ A <-->|"常驻控制 WSS：注册 / 心跳 / close"| S
+ S <-->|"常驻数据 WSS → NetConn → smux v2；每个 SSH 一个 stream"| A
+ A <-->|"每条 stream 独立 TCP 127.0.0.1:22"| H
+ N["SSH 端点：Server 与 sshd；私钥仅 Server 内存；单会话关闭不关闭共享 smux Session"]
+ S -.-> N

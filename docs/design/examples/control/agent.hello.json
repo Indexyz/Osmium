@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "type": "agent.hello",
+  "message_id": "m-001",
+  "payload": {
+    "agent_version": "0.1.0-dev",
+    "reported_labels": {
+      "os": "linux"
+    }
+  }
+}

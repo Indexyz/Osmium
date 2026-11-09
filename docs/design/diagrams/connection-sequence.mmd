@@ -1,0 +1,38 @@
+sequenceDiagram
+ autonumber
+ participant B as Browser
+ participant S as Go Server / SSH Gateway
+ participant C as step-ca
+ participant A as Go Agent
+ participant H as local sshd
+ A->>S: mTLS 控制 WSS + hello
+ S-->>A: welcome(epoch, data_tunnel_id, 短期 ticket)
+ A->>S: mTLS 数据 WSS + ticket
+ S->>S: 原子消费 ticket / smux.Client(version=2)
+ A->>A: smux.Server(version=2) / AcceptStream
+ S-->>A: control data_ready
+ Note over S,A: 数据 WSS 常驻复用，不为每个 SSH 新建 WSS
+ B->>S: OIDC 登录后的请求：host-123 / ops
+ S->>S: 授权、ready、owner/epoch 检查
+ B->>S: 绑定终端 WSS
+ S->>A: OpenStream + 有界 ssh.open 报头
+ A->>A: 校验 host/epoch/attempt/配额
+ A->>H: TCP dial 固定本机端口
+ A-->>S: 该 stream 的 ssh.open_result(ok)
+ S->>S: 重查权限，生成临时 key
+ S->>C: 公钥 + 签发授权 + target principal
+ C-->>S: 约 60 秒 SSH 用户证书
+ S->>S: 校验返回证书
+ S->>H: 经 smux stream 与 Agent 执行 SSH 握手
+ H-->>S: Host Key / Host Certificate
+ S->>S: 校验所选 host 身份
+ S->>H: 用户证书认证
+ H-->>S: success
+ S->>S: 激活前检查取消/撤权
+ S->>H: PTY + shell
+ S-->>B: active / 终端字节与 resize
+ Note over S,H: 用户证书到期不自动结束已建立的连接
+ B->>S: 关闭 / 管理员撤权
+ S->>A: 仅关闭本次 stream + session.close
+ A->>H: 关闭对应 TCP
+ Note over S,A: 其他 smux streams 不受单会话关闭影响

@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "type": "ssh.open_result",
+  "session_id": "s789",
+  "attempt_id": "a001",
+  "ok": true
+}

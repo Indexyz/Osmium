@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent control message v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "type": {
+          "const": "agent.hello"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "agent_version": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "reported_labels": {
+              "type": "object",
+              "maxProperties": 64,
+              "additionalProperties": {
+                "type": "string",
+                "maxLength": 256
+              }
+            }
+          },
+          "required": [
+            "agent_version",
+            "reported_labels"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "type",
+        "message_id",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "type": {
+          "const": "agent.welcome"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "host_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "connection_epoch": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "data_tunnel_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "data_path": {
+              "const": "/agent/v1/data"
+            },
+            "data_ticket": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 2048
+            },
+            "expires_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "smux_version": {
+              "const": 2
+            }
+          },
+          "required": [
+            "agent_id",
+            "host_id",
+            "connection_epoch",
+            "data_tunnel_id",
+            "data_path",
+            "data_ticket",
+            "expires_at",
+            "smux_version"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "type",
+        "message_id",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "type": {
+          "const": "agent.heartbeat"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connection_epoch": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "data_tunnel_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "data_connected": {
+              "type": "boolean"
+            },
+            "active_streams": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "connection_epoch",
+            "data_tunnel_id",
+            "data_connected",
+            "active_streams"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "type",
+        "message_id",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "type": {
+          "const": "agent.data_ready"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connection_epoch": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "data_tunnel_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "required": [
+            "connection_epoch",
+            "data_tunnel_id"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "type",
+        "message_id",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "type": {
+          "const": "session.close"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connection_epoch": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "session_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "attempt_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "required": [
+            "connection_epoch",
+            "session_id",
+            "attempt_id",
+            "reason"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "type",
+        "message_id",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "type": {
+          "const": "session.closed"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connection_epoch": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "session_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "attempt_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "required": [
+            "connection_epoch",
+            "session_id",
+            "attempt_id",
+            "reason"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "type",
+        "message_id",
+        "payload"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "server_id": "osmium-1",
+  "listen": "127.0.0.1:8080",
+  "public_url": "https://ssh.example.com",
+  "policy_file": "/etc/osmium/policy.json",
+
+  "agent_listen": ":8443",
+  "agent_tls_cert": "/etc/osmium/pki/server.crt",
+  "agent_tls_key": "/etc/osmium/pki/server.key",
+  "agent_client_ca": "/etc/osmium/pki/agent-ca.crt",
+
+  "oidc": {
+    "issuer": "https://idp.example.com",
+    "client_id": "osmium",
+    "client_secret_file": "/etc/osmium/oidc-client-secret",
+    "redirect_url": "https://ssh.example.com/auth/callback",
+    "scopes": ["openid", "profile", "email", "groups"],
+    "groups_claim": "groups"
+  },
+  "web_session_ttl": "8h",
+
+  "ca": {
+    "url": "https://ca.example.com",
+    "root_ca_file": "/etc/osmium/step-root.pem",
+    "provisioner_name": "web-ssh",
+    "jwk_file": "/etc/osmium/provisioner.jwk",
+    "jwk_password_file": "/etc/osmium/provisioner.password",
+    "timeout": "5s",
+    "user_ca_public_key_file": "/etc/osmium/user_ca.pub",
+    "max_cert_lifetime": "5m",
+    "allowed_extensions": ["permit-pty"]
+  },
+
+  "sessions": {
+    "attach_timeout": "60s",
+    "ssh_handshake": "15s",
+    "max_session_duration": "8h",
+    "max_per_user": 10,
+    "max_total": 1000,
+    "revoke_active": true
+  },
+
+  "tunnel_ticket_ttl": "30s",
+  "heartbeat_timeout": "45s",
+  "stream_open_timeout": "10s",
+  "max_streams_per_agent": 32
+}

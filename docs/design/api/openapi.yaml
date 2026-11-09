@@ -1,0 +1,291 @@
+openapi: 3.1.0
+info:
+  title: Web SSH control API (Go + smux handoff)
+  version: 0.2.0
+  description: 设计草案，不是已部署接口；Agent WebSocket 协议以 docs/05 和 schema 为准。
+security:
+- webSession: []
+paths:
+  /api/v1/hosts:
+    get:
+      operationId: listHosts
+      summary: 返回当前用户有权查看的主机；筛选不替代权限校验
+      parameters:
+      - name: label
+        in: query
+        style: form
+        explode: true
+        schema:
+          type: array
+          items:
+            type: string
+        description: 重复 label=key=value，以 AND 组合；语法为草案
+      responses:
+        '200':
+          description: 可见主机集合
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Host'
+                required:
+                - items
+        '400': &id001
+          description: 请求不合法
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': &id002
+          description: 未登录
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403': &id003
+          description: 无权限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': &id004
+          description: 状态或幂等冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': &id005
+          description: 主机/隧道/CA 不可用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/ssh-sessions:
+    post:
+      operationId: createSSHSession
+      summary: 创建待绑定终端的会话资源；不立即代表 SSH 已完成
+      parameters:
+      - &id007
+        name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSession'
+      responses:
+        '201':
+          description: 新会话资源
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHSession'
+        '200':
+          description: 同幂等请求的既有资源
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHSession'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '409': *id004
+        '503': *id005
+  /api/v1/ssh-sessions/{session_id}:
+    parameters:
+    - &id006
+      name: session_id
+      in: path
+      required: true
+      schema: &id008
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: ^[A-Za-z0-9._-]+$
+    get:
+      operationId: getSSHSession
+      summary: 按归属/管理员权限返回状态
+      responses:
+        '200':
+          description: 状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHSession'
+        '404':
+          description: 不可见或不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '409': *id004
+        '503': *id005
+  /api/v1/ssh-sessions/{session_id}/close:
+    parameters:
+    - *id006
+    post:
+      operationId: closeSSHSession
+      summary: 幂等关闭该会话，不关闭整个 Agent 的 smux Session
+      parameters:
+      - *id007
+      responses:
+        '202':
+          description: 接受关闭，状态可继续查询
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHSession'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '409': *id004
+        '503': *id005
+  /api/v1/ssh-sessions/{session_id}/terminal:
+    parameters:
+    - *id006
+    get:
+      operationId: attachTerminal
+      summary: WebSocket Upgrade；须验证 Origin、归属、单消费者和 session 状态
+      description: Subprotocol web-ssh-terminal.v1。帧定义见 terminal.schema.json；OpenAPI
+        不表示完整 WebSocket 协议。
+      responses:
+        '101':
+          description: WebSocket 已升级，等待 terminal.state=active 后才可输入
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '409': *id004
+        '503': *id005
+components:
+  securitySchemes:
+    webSession:
+      type: apiKey
+      in: cookie
+      name: web_session
+      description: 安全 HttpOnly cookie；写操作另做 CSRF，WebSocket 检查 Origin。
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+      required:
+      - code
+      - message
+      - request_id
+    Host:
+      type: object
+      additionalProperties: false
+      properties:
+        id: *id008
+        display_name:
+          type: string
+        status:
+          enum:
+          - offline
+          - connecting
+          - ready
+          - disabled
+        policy_labels:
+          type: object
+          maxProperties: 64
+          additionalProperties:
+            type: string
+            maxLength: 256
+        allowed_login_users:
+          type: array
+          items:
+            type: string
+      required:
+      - id
+      - display_name
+      - status
+      - policy_labels
+      - allowed_login_users
+    SSHSession:
+      type: object
+      additionalProperties: false
+      properties:
+        id: *id008
+        host_id: *id008
+        login_user:
+          type: string
+        state:
+          enum:
+          - created
+          - waiting_agent
+          - signing
+          - ssh_authenticating
+          - active
+          - closing
+          - closed
+          - failed
+        created_at:
+          type: string
+          format: date-time
+        terminal_path:
+          type: string
+        end_reason:
+          type:
+          - string
+          - 'null'
+      required:
+      - id
+      - host_id
+      - login_user
+      - state
+      - created_at
+      - terminal_path
+    CreateSession:
+      type: object
+      additionalProperties: false
+      properties:
+        host_id: *id008
+        login_user:
+          type: string
+          minLength: 1
+          maxLength: 64
+        terminal:
+          type: object
+          additionalProperties: false
+          properties:
+            rows:
+              type: integer
+              minimum: 1
+              maximum: 1000
+            cols:
+              type: integer
+              minimum: 1
+              maximum: 1000
+          required:
+          - rows
+          - cols
+      required:
+      - host_id
+      - login_user
+      - terminal

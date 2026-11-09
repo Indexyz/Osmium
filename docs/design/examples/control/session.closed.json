@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "type": "session.closed",
+  "message_id": "m-006",
+  "payload": {
+    "connection_epoch": 7,
+    "session_id": "s789",
+    "attempt_id": "a001",
+    "reason": "permission_revoked"
+  }
+}

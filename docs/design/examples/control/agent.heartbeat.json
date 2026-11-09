@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "type": "agent.heartbeat",
+  "message_id": "m-003",
+  "payload": {
+    "connection_epoch": 7,
+    "data_tunnel_id": "dt-007",
+    "data_connected": true,
+    "active_streams": 2
+  }
+}

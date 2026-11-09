@@ -1,0 +1,6 @@
+# OPTIONAL alternative to AuthorizedPrincipalsFile, not an additive requirement.
+# The helper and dedicated OS user do NOT exist in this bundle.
+# Implement and test the helper before using this configuration.
+AuthorizedPrincipalsFile none
+AuthorizedPrincipalsCommand /usr/local/libexec/my-agent-principals %u
+AuthorizedPrincipalsCommandUser ssh-principals

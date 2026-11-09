@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "type": "terminal.exit",
+  "payload": {
+    "reason": "shell_exit",
+    "exit_status": 0
+  }
+}

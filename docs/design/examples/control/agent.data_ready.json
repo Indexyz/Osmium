@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "type": "agent.data_ready",
+  "message_id": "m-004",
+  "payload": {
+    "connection_epoch": 7,
+    "data_tunnel_id": "dt-007"
+  }
+}

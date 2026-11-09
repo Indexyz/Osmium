@@ -1,0 +1,28 @@
+{
+  "scope": "t1",
+  "admins": [{"group": "ssh-admins"}],
+  "hosts": [
+    {
+      "id": "host-123",
+      "display_name": "prod-web-1",
+      "policy_labels": {"env": "prod", "role": "web"},
+      "allowed_login_users": ["deploy", "ops"],
+      "ssh_host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaIVaeoO7KLvIrJT1KhprUFC/l1liRbnqh8PSLRkz4v"],
+      "agent": {"id": "agent-123", "client_cert_cn": "agent-123"}
+    }
+  ],
+  "grants": [
+    {
+      "id": "ops-prod",
+      "subjects": [{"group": "ops"}],
+      "hosts": {"labels": {"env": "prod"}},
+      "logins": ["ops"]
+    },
+    {
+      "id": "alice-deploy",
+      "subjects": [{"issuer": "https://idp.example.com", "subject": "alice-oidc-sub"}],
+      "hosts": {"ids": ["host-123"]},
+      "logins": ["deploy"]
+    }
+  ]
+}
