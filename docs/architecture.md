@@ -26,7 +26,7 @@ osmium CLI + ssh ───┘          ▲
     1. 生成一次性的 ed25519 密钥；
     2. Agent 确认 stream 后，向 step-ca 申请签发证书，principal 为 `tenant:<scope>:host:<id>:login:<user>`；
     3. 校验返回的证书；
-    4. 用策略里登记的主机公钥严格校验 host key，然后建立 PTY shell，通过 xterm.js 呈现给浏览器。
+    4. 用策略里登记的主机公钥严格校验 host key，然后建立 PTY shell，通过 React + Ghostty（`ghostty-web` WASM）呈现给浏览器。
   - **原生模式**：用户本机的 OpenSSH 客户端与 sshd 端到端通信，Server 只做授权、签发证书和字节转发，看不到明文。见 [native-ssh.md](native-ssh.md)。
 - **授权**完全在服务端，由策略文件定义（[design/03-authorization.md](design/03-authorization.md)）：
   - 客户端只能提交 `host_id`、`login_user`、终端尺寸，原生模式下再加一把公钥；
@@ -58,5 +58,5 @@ osmium CLI + ssh ───┘          ▲
 | `internal/audit` | 审计事件：本地 JSONL 分段、上传到 S3 兼容存储，以及按时间和字段的检索 |
 | `internal/client` | CLI 客户端：登录、主机列表、调用本机 ssh |
 | `internal/e2e` | 端到端测试（真实 sshd / ssh / ssh-agent，可选真实 step-ca） |
-| `web/` | 前端（原生 JS + xterm.js） |
+| `web/` | 前端（React + TypeScript + `ghostty-web`，Vite 构建产物嵌入 `web/dist`） |
 | `examples/` | 配置示例 |

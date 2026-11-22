@@ -3,11 +3,21 @@
 ## 构建
 
 ```sh
-make build                        # 发布构建，输出 ./osmium
+make web                          # 构建 React + ghostty-web 前端到 web/dist
+make build                        # 构建前端并发布构建 Server + CLI，输出 ./osmium
 make agent                        # 独立 Agent，输出 ./osmium-agent（可加 GOOS/GOARCH/GOARM 交叉编译）
 make size                         # 构建两者并打印体积
-go build -o osmium ./cmd/osmium   # 调试构建（保留符号表，体积大）
+go build -o osmium ./cmd/osmium   # 调试构建（保留符号表，体积大；复用已有 web/dist）
 ./osmium --help
+```
+
+前端开发（在 `web/` 目录下，使用 Vite 热更新并代理 `/api` 和 `/auth` 到本地 `127.0.0.1:8080`）：
+
+```sh
+npm --prefix web install
+npm --prefix web run dev          # 前端开发服务器
+npm --prefix web test             # Vitest 单元测试
+npm --prefix web run build        # 类型检查并生成 web/dist
 ```
 
 `make build` 等价于：

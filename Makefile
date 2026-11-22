@@ -2,8 +2,11 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GOFLAGS_RELEASE = -trimpath -ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: build agent test size
-build:
+.PHONY: web build agent test size
+web:
+	npm --prefix web run build
+
+build: web
 	CGO_ENABLED=0 go build $(GOFLAGS_RELEASE) -o osmium ./cmd/osmium
 
 # 目标主机（边缘设备）上的独立 Agent：不含 Server、CLI、cobra。
@@ -12,6 +15,7 @@ agent:
 	CGO_ENABLED=0 go build $(GOFLAGS_RELEASE) -o osmium-agent ./cmd/osmium-agent
 
 test:
+	npm --prefix web test
 	go test -race ./...
 
 size: build agent

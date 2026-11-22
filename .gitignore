@@ -1,3 +1,4 @@
 dev/
 /osmium
 /osmium-agent
+web/node_modules/

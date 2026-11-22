@@ -14,7 +14,7 @@
 | — | 主机身份 | 只支持登记固定的 host key，尚未支持 host CA |
 | — | 桌面 ssh-agent / 原生 OpenSSH | 已通过 `osmium ssh` 实现，见 [native-ssh.md](native-ssh.md)。CLI 令牌与 Web 会话的有效期相同 |
 | — | 审计 | 参考 Teleport 的审计日志：事件追加写入本地分段文件；配置 `audit.s3` 后，封口的分段 gzip 上传到 S3 兼容存储（AWS S3、MinIO、RustFS），本地只作缓冲。管理员通过 `GET /api/v1/admin/audit` 按时间、用户等字段查询。不做防篡改 |
-| — | 前端依赖 | xterm.js 从 jsDelivr 加载（CSP 已放行）。离线部署需要改为本地托管 |
+| — | 前端依赖 | 使用 React + `ghostty-web`（WASM），由 Vite 本地打包并嵌入 Server 二进制（`web/dist`），不再依赖外部 CDN，支持离线部署 |
 
 ## 尚未实现
 
