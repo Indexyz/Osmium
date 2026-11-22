@@ -335,15 +335,15 @@ func (s *Server) adminAgents(w http.ResponseWriter, r *http.Request, rc *reqCtx)
 }
 
 // adminAudit searches the persistent audit log (admins only). Query:
-// from, to (RFC 3339; default the last 24h), action, actor, session_id,
-// target, limit (1..1000, default 100), cursor (from next_cursor).
+// from, to (RFC 3339; default the last 24h), user (display name or user ID),
+// action, actor, session_id, target, limit (1..1000, default 100), cursor (from next_cursor).
 func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 	if !rc.subject.IsAdmin {
 		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
 		return
 	}
 	v := r.URL.Query()
-	q := audit.Query{Action: v.Get("action"), Actor: v.Get("actor"), SessionID: v.Get("session_id"), Target: v.Get("target"), Cursor: v.Get("cursor"), Limit: 100}
+	q := audit.Query{Action: v.Get("action"), User: v.Get("user"), Actor: v.Get("actor"), SessionID: v.Get("session_id"), Target: v.Get("target"), Cursor: v.Get("cursor"), Limit: 100}
 	q.To = time.Now()
 	var err error
 	if p := v.Get("to"); p != "" {
@@ -365,7 +365,7 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request, rc *reqCtx) 
 			return
 		}
 	}
-	page, err := s.Audit.Search(q)
+	page, err := s.Audit.Search(r.Context(), q)
 	switch {
 	case errors.Is(err, audit.ErrBadQuery):
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())

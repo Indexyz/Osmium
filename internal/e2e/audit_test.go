@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/indexyz/osmium/internal/audit"
+	"github.com/indexyz/osmium/internal/authn"
 )
 
 // Audit events are persisted to the daily files and searchable by admins
@@ -51,6 +52,19 @@ func TestAuditPersistedAndSearchable(t *testing.T) {
 		}
 	}
 
+	// By user: display name or internal ID, never another user's events.
+	for _, u := range []string{"alice (dev)", authn.UserID("dev", "alice")} {
+		q = url.Values{"user": {u}}
+		if getJSON(t, admin.c, e.web.URL+"/api/v1/admin/audit?"+q.Encode(), &page); len(page.Events) == 0 {
+			t.Fatalf("user=%s: no events", u)
+		}
+		for _, ev := range page.Events {
+			if ev.Actor != "user:"+authn.UserID("dev", "alice") || ev.User != "alice (dev)" {
+				t.Fatalf("user=%s returned %+v", u, ev)
+			}
+		}
+	}
+
 	// Filters and pagination through the API.
 	q = url.Values{"session_id": {v.ID}, "action": {"ca.sign"}}
 	if getJSON(t, admin.c, e.web.URL+"/api/v1/admin/audit?"+q.Encode(), &page); len(page.Events) != 1 {
@@ -72,7 +86,7 @@ func TestAuditPersistedAndSearchable(t *testing.T) {
 	}
 
 	// The files on disk hold the same events and no secret material.
-	files, _ := filepath.Glob(filepath.Join(e.dir, "audit", "*.jsonl"))
+	files, _ := filepath.Glob(filepath.Join(e.dir, "audit", "*", "*.jsonl"))
 	if len(files) == 0 {
 		t.Fatal("no audit files written")
 	}

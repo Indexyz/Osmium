@@ -174,7 +174,7 @@ func (a *Authenticator) HandleCLIApprove(w http.ResponseWriter, r *http.Request)
 	}
 	a.cliCodes[key(code)] = cliCode{user: s.User, challenge: p.Challenge, expires: now.Add(cliCodeTTL)}
 	a.mu.Unlock()
-	a.audit.Record(audit.Event{Actor: "user:" + s.User.ID, Action: "cli.authorize", Result: "ok"})
+	a.audit.Record(audit.Event{Actor: "user:" + s.User.ID, User: s.User.DisplayName, Action: "cli.authorize", Result: "ok"})
 	// Only ever redirect to the loopback interface of the user's machine.
 	q := url.Values{"code": {code}, "state": {p.State}}
 	http.Redirect(w, r, "http://127.0.0.1:"+strconv.Itoa(p.Port)+"/callback?"+q.Encode(), http.StatusSeeOther)
@@ -215,7 +215,7 @@ func (a *Authenticator) HandleCLIToken(w http.ResponseWriter, r *http.Request) {
 	}
 	a.cliTokens[key(tok)] = t
 	a.mu.Unlock()
-	a.audit.Record(audit.Event{Actor: "user:" + c.user.ID, Action: "cli.token", Result: "ok"})
+	a.audit.Record(audit.Event{Actor: "user:" + c.user.ID, User: c.user.DisplayName, Action: "cli.token", Result: "ok"})
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]any{"access_token": tok, "token_type": "Bearer", "expires_at": t.ExpiresAt, "user": c.user})

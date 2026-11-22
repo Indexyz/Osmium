@@ -305,7 +305,7 @@ func (m *Manager) admitLocked(u authz.Subject, hostID, login, mode string) (*Ses
 	snap := m.store.Current()
 	d := snap.Check(u, hostID, login)
 	if !d.Allowed {
-		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "denied", Target: hostID + "/" + login, Revision: d.Revision, Reason: d.Reason, Extra: map[string]any{"mode": mode}})
+		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: hostID + "/" + login, Revision: d.Revision, Reason: d.Reason, Extra: map[string]any{"mode": mode}})
 		return nil, ErrForbidden
 	}
 	host, _ := snap.Host(hostID)
@@ -329,7 +329,7 @@ func (m *Manager) admitLocked(u authz.Subject, hostID, login, mode string) (*Ses
 	s := &Session{ID: newID("s-"), Subject: u, HostID: hostID, Login: login, CreatedAt: time.Now().UTC(), Mode: mode,
 		state: StateCreated, policyRevision: d.Revision, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	m.sessions[s.ID] = s
-	m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "ok", Target: hostID + "/" + login, SessionID: s.ID, Revision: d.Revision, Extra: map[string]any{"mode": mode}})
+	m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "ok", Target: hostID + "/" + login, SessionID: s.ID, Revision: d.Revision, Extra: map[string]any{"mode": mode}})
 	time.AfterFunc(m.cfg.AttachTimeout, func() {
 		s.mu.Lock()
 		attached := s.attached
@@ -426,7 +426,7 @@ func (m *Manager) terminate(s *Session, state, reason string) {
 		m.hub.CloseAttempt(att.AgentID, att.Epoch, s.ID, att.ID, reason)
 	}
 	if s.finish(state, reason) {
-		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "session.end", Result: state, Target: s.HostID + "/" + s.Login, SessionID: s.ID, Reason: reason})
+		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session.end", Result: state, Target: s.HostID + "/" + s.Login, SessionID: s.ID, Reason: reason})
 	}
 }
 
@@ -513,7 +513,7 @@ func (m *Manager) failure(s *Session, phase string, err error) string {
 func (m *Manager) recheck(s *Session, phase string) bool {
 	d := m.store.Current().Check(s.Subject, s.HostID, s.Login)
 	if !d.Allowed {
-		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "session." + phase, Result: "denied", SessionID: s.ID, Revision: d.Revision, Reason: d.Reason})
+		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session." + phase, Result: "denied", SessionID: s.ID, Revision: d.Revision, Reason: d.Reason})
 		return false
 	}
 	s.mu.Lock()
@@ -567,7 +567,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	req := ca.Request{PublicKey: key.PublicKey(), KeyID: "user:" + s.Subject.UserID + "/session:" + s.ID, Principal: authz.Principal(snap.Scope, s.HostID, s.Login)}
 	cert, err := m.signer.SignUserCert(ctx, req)
 	if err != nil {
-		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "ca.sign", Result: "error", SessionID: s.ID, AttemptID: attemptID})
+		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ca.sign", Result: "error", SessionID: s.ID, AttemptID: attemptID})
 		return m.failure(s, "ca_sign", err), nil
 	}
 	s.mu.Lock()
@@ -577,7 +577,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	att.ValidAfter = time.Unix(int64(cert.ValidAfter), 0).UTC()
 	att.ValidBefore = time.Unix(int64(cert.ValidBefore), 0).UTC()
 	s.mu.Unlock()
-	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "ca.sign", Result: "ok", SessionID: s.ID, AttemptID: attemptID,
+	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ca.sign", Result: "ok", SessionID: s.ID, AttemptID: attemptID,
 		Extra: map[string]any{"serial": fmt.Sprint(cert.Serial), "key_id": cert.KeyId, "valid_after": att.ValidAfter, "valid_before": att.ValidBefore, "fingerprint": att.PublicKeyFingerprint, "epoch": att.Epoch, "stream_id": att.StreamID}})
 
 	if !s.transition(StateSSHAuthenticating, StateSigning) {
@@ -586,7 +586,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	client, err := sshgateway.Connect(ctx, stream, sshgateway.Target{HostID: s.HostID, Login: s.Login, HostKeys: host.HostKeys()}, key, cert, m.cfg.SSHHandshake)
 	if err != nil {
 		if errors.Is(err, sshgateway.ErrHostKeyMismatch) || strings.Contains(err.Error(), sshgateway.ErrHostKeyMismatch.Error()) {
-			m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "ssh.host_key", Result: "mismatch", Target: s.HostID, SessionID: s.ID})
+			m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ssh.host_key", Result: "mismatch", Target: s.HostID, SessionID: s.ID})
 			return "host_key_mismatch", nil
 		}
 		return m.failure(s, "ssh_auth", err), nil
@@ -632,7 +632,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	if !s.transition(StateActive, StateSSHAuthenticating) {
 		return "cancelled", nil
 	}
-	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "session.active", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, AttemptID: attemptID})
+	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session.active", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, AttemptID: attemptID})
 
 	var outWG sync.WaitGroup
 	pump := func(r io.Reader) {

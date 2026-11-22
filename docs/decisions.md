@@ -13,13 +13,14 @@
 | — | Agent 身份 | 用专用客户端 CA 做 mTLS，CN 映射到策略中的主机 |
 | — | 主机身份 | 只支持登记固定的 host key，尚未支持 host CA |
 | — | 桌面 ssh-agent / 原生 OpenSSH | 已通过 `osmium ssh` 实现，见 [native-ssh.md](native-ssh.md)。CLI 令牌与 Web 会话的有效期相同 |
-| — | 审计 | 参考 Teleport 的文件审计日志，追加写入 `audit.dir`，每个 UTC 日一个 JSONL 文件，按 `audit.retention` 清理。管理员通过 `GET /api/v1/admin/audit` 查询。单副本、本地磁盘，不防篡改 |
+| — | 审计 | 参考 Teleport 的审计日志：事件追加写入本地分段文件；配置 `audit.s3` 后，封口的分段 gzip 上传到 S3 兼容存储（AWS S3、MinIO、RustFS），本地只作缓冲。管理员通过 `GET /api/v1/admin/audit` 按时间、用户等字段查询。不做防篡改 |
 | — | 前端依赖 | xterm.js 从 jsDelivr 加载（CSP 已放行）。离线部署需要改为本地托管 |
 
 ## 尚未实现
 
-- 会话状态的持久化，多副本部署（多副本需要共享的审计存储）。
-- 审计日志的防篡改（哈希链或签名）和外部存储后端。
+- 会话状态的持久化，多副本部署。审计已可通过 S3 共享，并按 `server_id` 区分。
+- 审计日志的防篡改，例如哈希链、签名或 Object Lock。当前不需要，所以没有做。
+- 审计全文检索或 Athena 一类的分析查询。目前只支持按时间和字段做精确过滤。
 - SSH host CA 校验。
 - 管理 UI：目前只有 API：`GET /api/v1/admin/agents` 和 `GET /api/v1/admin/audit`。
 - 会话录制，以及 SFTP、端口转发。

@@ -153,7 +153,7 @@ func CheckCSRF(r *http.Request, s *WebSession) bool {
 
 // Subject builds the authorization subject for a user.
 func Subject(u User, snap *authz.Snapshot) authz.Subject {
-	s := authz.Subject{UserID: u.ID, Issuer: u.Issuer, Sub: u.Subject, Groups: u.Groups}
+	s := authz.Subject{UserID: u.ID, Issuer: u.Issuer, Sub: u.Subject, Groups: u.Groups, Name: u.DisplayName}
 	s.IsAdmin = snap.IsAdmin(s)
 	return s
 }
@@ -171,7 +171,7 @@ func (a *Authenticator) startSession(w http.ResponseWriter, u User) {
 	a.sessions[key(tok)] = s
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: tok, Path: "/", HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode, Expires: s.ExpiresAt})
-	a.audit.Record(audit.Event{Actor: "user:" + u.ID, Action: "web.login", Result: "ok", Extra: map[string]any{"issuer": u.Issuer}})
+	a.audit.Record(audit.Event{Actor: "user:" + u.ID, User: u.DisplayName, Action: "web.login", Result: "ok", Extra: map[string]any{"issuer": u.Issuer}})
 }
 
 // HandleLogin starts the OIDC flow.

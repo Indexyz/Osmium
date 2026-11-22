@@ -79,6 +79,16 @@ nix shell nixpkgs#step-ca nixpkgs#step-cli -c go test -run StepCA -v ./internal/
 
 B01 的测量结果：step-ca 默认把 `valid_after` 往前回拨 1 分钟，所以总区间是 120 秒，签发后剩余约 60 秒，见 [decisions.md](decisions.md) 的 O05。如果需要排查 CA 一侧的拒绝原因，加上 `E2E_LOG=1` 可以输出 step-ca 日志。
 
+### 与 S3 兼容存储联调
+
+如果 PATH 中有 `rustfs`，`internal/audit/s3_test.go` 会启动一个临时的 RustFS 服务。它检查 bucket 不存在、凭据错误和 endpoint 格式错误时会报错，并验证一个 Server 上传的审计事件，能从另一个本地目录为空的 Server 查到。如果 PATH 中没有 `rustfs`，这些测试会自动跳过。其余上传逻辑，包括封口、故障补传、去重、扫描上限和保留期，都在单元测试里用内存 Store 覆盖。
+
+```sh
+nix shell nixpkgs#rustfs -c go test -run RustFS -v ./internal/audit/
+```
+
+nixpkgs 已移除 MinIO 服务端，所以这里用 RustFS 测试。客户端使用 minio-go，与 MinIO 的兼容性由该库保证。
+
 ## 本地登录
 
 在 server 配置里设置 `"dev_login": true` 可以不用 OIDC，然后访问 `/auth/dev-login?user=alice&group=ops`，用户的 issuer 为 `dev`。**生产环境禁止开启。**

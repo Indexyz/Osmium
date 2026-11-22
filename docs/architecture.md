@@ -55,7 +55,7 @@ osmium CLI + ssh ───┘          ▲
 | `internal/authz` | 策略、授权和主机可见性 |
 | `internal/authn` | OIDC 登录、Web 会话、CLI 登录与 Bearer 令牌 |
 | `internal/server` | HTTP API、终端 WebSocket 和原生隧道 |
-| `internal/audit` | 审计事件：按日落盘的 JSONL 文件，以及按时间和字段的检索 |
+| `internal/audit` | 审计事件：本地 JSONL 分段、上传到 S3 兼容存储，以及按时间和字段的检索 |
 | `internal/client` | CLI 客户端：登录、主机列表、调用本机 ssh |
 | `internal/e2e` | 端到端测试（真实 sshd / ssh / ssh-agent，可选真实 step-ca） |
 | `web/` | 前端（原生 JS + xterm.js） |

@@ -40,6 +40,31 @@ func newServerCmd() *cobra.Command {
 	return c
 }
 
+func openAudit(ctx context.Context, cfg *config.Server, log *slog.Logger) (*audit.Logger, error) {
+	ac := audit.Config{Dir: cfg.Audit.Dir, ServerID: cfg.ServerID, Retention: cfg.Audit.Retention.D(),
+		OnError: func(err error) { log.Error("audit", "err", err) }}
+	if cfg.Audit.Stdout {
+		ac.Mirror = os.Stdout
+	}
+	if s := cfg.Audit.S3; s != nil {
+		sc := audit.S3Config{Endpoint: s.Endpoint, Bucket: s.Bucket, Prefix: s.Prefix, Region: s.Region, AccessKeyID: s.AccessKeyID, CAFile: s.CAFile}
+		if s.SecretAccessKeyFile != "" {
+			b, err := os.ReadFile(s.SecretAccessKeyFile)
+			if err != nil {
+				return nil, err
+			}
+			sc.SecretAccessKey = strings.TrimSpace(string(b))
+		}
+		store, err := audit.NewS3(ctx, sc)
+		if err != nil {
+			return nil, err
+		}
+		ac.Store, ac.SegmentInterval, ac.SegmentMaxBytes = store, s.SegmentInterval.D(), s.SegmentMaxBytes
+		log.Info("audit: uploading to s3", "endpoint", s.Endpoint, "bucket", s.Bucket, "prefix", s.Prefix)
+	}
+	return audit.Open(ac)
+}
+
 func readUserCAKeys(path string) ([]string, error) {
 	if path == "" {
 		return nil, errors.New("ca.user_ca_public_key_file is required")
@@ -70,15 +95,15 @@ func runServer(cfgPath string, log *slog.Logger) error {
 		return err
 	}
 	store := authz.NewStore(snap)
-	auditCfg := audit.Config{Dir: cfg.Audit.Dir, Retention: cfg.Audit.Retention.D(), OnError: func(err error) { log.Error("audit write failed", "err", err) }}
-	if cfg.Audit.Stdout {
-		auditCfg.Mirror = os.Stdout
-	}
-	aud, err := audit.Open(auditCfg)
+	aud, err := openAudit(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
-	defer aud.Close()
+	defer func() {
+		if err := aud.Close(); err != nil {
+			log.Error("audit: final upload failed; segments stay on disk for the next start", "err", err)
+		}
+	}()
 
 	caKeys, err := readUserCAKeys(cfg.CA.UserCAPublicKeyFile)
 	if err != nil {

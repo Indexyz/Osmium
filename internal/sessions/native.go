@@ -72,7 +72,7 @@ func (m *Manager) CreateNative(u authz.Subject, r NativeRequest) (*Session, erro
 	defer m.mu.Unlock()
 	m.gcLocked()
 	if _, seen := m.seenKeys[fp]; seen {
-		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, Action: "session.create", Result: "denied", Target: r.HostID + "/" + r.Login, Reason: "key_reused", Extra: map[string]any{"mode": ModeNative, "fingerprint": fp}})
+		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: r.HostID + "/" + r.Login, Reason: "key_reused", Extra: map[string]any{"mode": ModeNative, "fingerprint": fp}})
 		return nil, ErrKeyReused
 	}
 	s, err := m.admitLocked(u, r.HostID, r.Login, ModeNative)
@@ -158,7 +158,7 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 	req := ca.Request{PublicKey: s.clientKey, KeyID: "user:" + s.Subject.UserID + "/session:" + s.ID, Principal: authz.Principal(snap.Scope, s.HostID, s.Login)}
 	cert, err := m.signer.SignUserCert(ctx, req)
 	if err != nil {
-		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "ca.sign", Result: "error", SessionID: s.ID, AttemptID: attemptID})
+		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ca.sign", Result: "error", SessionID: s.ID, AttemptID: attemptID})
 		return m.failure(s, "ca_sign", err)
 	}
 	s.mu.Lock()
@@ -168,7 +168,7 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 	att.ValidAfter = time.Unix(int64(cert.ValidAfter), 0).UTC()
 	att.ValidBefore = time.Unix(int64(cert.ValidBefore), 0).UTC()
 	s.mu.Unlock()
-	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "ca.sign", Result: "ok", SessionID: s.ID, AttemptID: attemptID,
+	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ca.sign", Result: "ok", SessionID: s.ID, AttemptID: attemptID,
 		Extra: map[string]any{"mode": ModeNative, "serial": fmt.Sprint(cert.Serial), "key_id": cert.KeyId, "valid_after": att.ValidAfter, "valid_before": att.ValidBefore, "fingerprint": att.PublicKeyFingerprint, "epoch": att.Epoch, "stream_id": att.StreamID}})
 
 	// The Server cannot observe SSH authentication in this mode; the last
@@ -185,7 +185,7 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 	if err := c.Ready(cert, host.HostKeys()); err != nil {
 		return "client_disconnected"
 	}
-	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, Action: "session.active", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, AttemptID: attemptID, Extra: map[string]any{"mode": ModeNative}})
+	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session.active", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, AttemptID: attemptID, Extra: map[string]any{"mode": ModeNative}})
 
 	type result struct{ client bool }
 	done := make(chan result, 2)

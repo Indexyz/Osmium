@@ -104,9 +104,23 @@ type Sessions struct {
 
 // Audit configures the persistent audit log.
 type Audit struct {
-	Dir       string   `json:"dir"`       // dedicated directory, one JSONL file per UTC day
-	Retention Duration `json:"retention"` // 0 keeps files forever
+	Dir       string   `json:"dir"`       // dedicated directory: all segments, or only those not yet uploaded
+	Retention Duration `json:"retention"` // 0 keeps everything
 	Stdout    bool     `json:"stdout"`    // also mirror every event to stdout
+	S3        *AuditS3 `json:"s3"`        // optional S3-compatible storage (AWS S3, MinIO, RustFS)
+}
+
+// AuditS3 uploads sealed audit segments to an S3-compatible bucket.
+type AuditS3 struct {
+	Endpoint            string   `json:"endpoint"` // http(s)://host[:port]
+	Bucket              string   `json:"bucket"`
+	Prefix              string   `json:"prefix"`
+	Region              string   `json:"region"`
+	AccessKeyID         string   `json:"access_key_id"` // empty: AWS_* / MINIO_* env, then IAM
+	SecretAccessKeyFile string   `json:"secret_access_key_file"`
+	CAFile              string   `json:"ca_file"`
+	SegmentInterval     Duration `json:"segment_interval"`  // default 5m
+	SegmentMaxBytes     int64    `json:"segment_max_bytes"` // default 8 MiB
 }
 
 // Server is the server configuration.
@@ -190,6 +204,23 @@ func LoadServer(path string) (*Server, error) {
 	}
 	if c.Audit.Dir == "" {
 		return nil, errors.New("config: audit.dir is required")
+	}
+	if s := c.Audit.S3; s != nil {
+		if s.Endpoint == "" || s.Bucket == "" {
+			return nil, errors.New("config: audit.s3.endpoint and audit.s3.bucket are required")
+		}
+		if (s.AccessKeyID == "") != (s.SecretAccessKeyFile == "") {
+			return nil, errors.New("config: audit.s3.access_key_id and audit.s3.secret_access_key_file go together")
+		}
+		if s.SegmentInterval == 0 {
+			s.SegmentInterval = Duration(5 * time.Minute)
+		}
+		if s.SegmentMaxBytes == 0 {
+			s.SegmentMaxBytes = 8 << 20
+		}
+		if s.SegmentInterval.D() < time.Second || s.SegmentMaxBytes < 0 {
+			return nil, errors.New("config: audit.s3.segment_interval must be at least 1s and segment_max_bytes positive")
+		}
 	}
 	if c.OIDC == nil && !c.DevLogin {
 		return nil, errors.New("config: oidc is required (dev_login is for local development only)")

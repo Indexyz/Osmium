@@ -38,6 +38,9 @@ type Subject struct {
 	Sub     string
 	Groups  []string
 	IsAdmin bool
+	// Name is the IdP display name, for audit and UI only; never used to
+	// authorize.
+	Name string
 }
 
 // SubjectSelector matches users. Exactly one form must be set.
