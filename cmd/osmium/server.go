@@ -70,7 +70,15 @@ func runServer(cfgPath string, log *slog.Logger) error {
 		return err
 	}
 	store := authz.NewStore(snap)
-	aud := audit.New(os.Stdout)
+	auditCfg := audit.Config{Dir: cfg.Audit.Dir, Retention: cfg.Audit.Retention.D(), OnError: func(err error) { log.Error("audit write failed", "err", err) }}
+	if cfg.Audit.Stdout {
+		auditCfg.Mirror = os.Stdout
+	}
+	aud, err := audit.Open(auditCfg)
+	if err != nil {
+		return err
+	}
+	defer aud.Close()
 
 	caKeys, err := readUserCAKeys(cfg.CA.UserCAPublicKeyFile)
 	if err != nil {

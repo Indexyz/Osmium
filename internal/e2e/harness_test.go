@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,7 +54,8 @@ type env struct {
 	t        *testing.T
 	dir      string
 	login    string
-	fake     *catest.FakeCA
+	fake     *catest.FakeCA // nil when running against a real step-ca
+	userCA   string         // authorized_keys line of the SSH User CA trusted by sshd
 	signer   *ca.StepCA
 	store    *authz.Store
 	hub      *agenthub.Hub
@@ -105,7 +107,7 @@ func (e *env) startSSHD(hostID, scope string) *sshdInstance {
 		t.Fatal(err)
 	}
 	hk := writeHostKey(t, filepath.Join(d, "hostkey"))
-	if err := os.WriteFile(filepath.Join(d, "user_ca.pub"), []byte(e.fake.UserCAAuthorizedKey()), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(d, "user_ca.pub"), []byte(e.userCA), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(d, "principals", e.login), []byte(authz.Principal(scope, hostID, e.login)+"\n"), 0o644); err != nil {
@@ -149,7 +151,28 @@ LoginGraceTime 30
 	return s
 }
 
-func newEnv(t *testing.T) *env {
+// caSource yields the step-ca client config and the SSH User CA key that the
+// test sshd instances trust.
+type caSource func(e *env) (ca.StepConfig, string)
+
+// fakeCA is the in-process step-ca stand-in used by most tests.
+func fakeCA(e *env) (ca.StepConfig, string) {
+	var err error
+	e.fake, err = catest.New("web-ssh")
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(e.fake.Close)
+	cfg, err := e.fake.ClientConfig(e.dir)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return cfg, e.fake.UserCAAuthorizedKey()
+}
+
+func newEnv(t *testing.T) *env { return newEnvWithCA(t, fakeCA) }
+
+func newEnvWithCA(t *testing.T, source caSource) *env {
 	if testing.Short() {
 		t.Skip("e2e skipped in -short mode")
 	}
@@ -158,15 +181,8 @@ func newEnv(t *testing.T) *env {
 		t.Skip("current user name is not a valid login for the test")
 	}
 	e := &env{t: t, dir: t.TempDir(), login: u.Username, sshd: map[string]*sshdInstance{}, agents: map[string]context.CancelFunc{}, ready: map[string]chan uint64{}}
-	e.fake, err = catest.New("web-ssh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.fake.Close)
-	cfg, err := e.fake.ClientConfig(e.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg, userCA := source(e)
+	e.userCA = userCA
 	if e.signer, err = ca.NewStepCA(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -177,11 +193,19 @@ func newEnv(t *testing.T) *env {
 	if os.Getenv("E2E_LOG") != "" {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
-	var auditOut io.Writer = io.Discard
+	auditCfg := audit.Config{Dir: filepath.Join(e.dir, "audit"), OnError: func(err error) {
+		// Background session goroutines may still record after cleanup closed the log.
+		if !errors.Is(err, audit.ErrClosed) {
+			t.Errorf("audit: %v", err)
+		}
+	}}
 	if os.Getenv("E2E_LOG") != "" {
-		auditOut = os.Stderr
+		auditCfg.Mirror = os.Stderr
 	}
-	e.audit = audit.New(auditOut)
+	if e.audit, err = audit.Open(auditCfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.audit.Close() })
 	e.hub = agenthub.New(agenthub.Config{HeartbeatTimeout: 5 * time.Second, MaxStreams: 4}, e.store, e.audit, log)
 	e.mgr = sessions.NewManager(sessions.Config{RevokeActive: true}, e.store, e.hub, e.signer, e.audit, log)
 	auth, err := authn.New(context.Background(), authn.Config{DevLogin: true}, e.audit, log)

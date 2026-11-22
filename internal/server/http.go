@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +62,7 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("POST /api/v1/ssh-sessions/{session_id}/close", s.authed(s.csrf(s.closeSession)))
 	mux.HandleFunc("GET /api/v1/ssh-sessions/{session_id}/terminal", s.authed(s.terminal))
 	mux.HandleFunc("GET /api/v1/admin/agents", s.authed(s.adminAgents))
+	mux.HandleFunc("GET /api/v1/admin/audit", s.authed(s.adminAudit))
 	return securityHeaders(mux)
 }
 
@@ -330,6 +332,52 @@ func (s *Server) adminAgents(w http.ResponseWriter, r *http.Request, rc *reqCtx)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": s.Hub.Agents()})
+}
+
+// adminAudit searches the persistent audit log (admins only). Query:
+// from, to (RFC 3339; default the last 24h), action, actor, session_id,
+// target, limit (1..1000, default 100), cursor (from next_cursor).
+func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	v := r.URL.Query()
+	q := audit.Query{Action: v.Get("action"), Actor: v.Get("actor"), SessionID: v.Get("session_id"), Target: v.Get("target"), Cursor: v.Get("cursor"), Limit: 100}
+	q.To = time.Now()
+	var err error
+	if p := v.Get("to"); p != "" {
+		if q.To, err = time.Parse(time.RFC3339, p); err != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "to must be RFC 3339")
+			return
+		}
+	}
+	q.From = q.To.Add(-24 * time.Hour)
+	if p := v.Get("from"); p != "" {
+		if q.From, err = time.Parse(time.RFC3339, p); err != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "from must be RFC 3339")
+			return
+		}
+	}
+	if p := v.Get("limit"); p != "" {
+		if q.Limit, err = strconv.Atoi(p); err != nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "limit must be an integer")
+			return
+		}
+	}
+	page, err := s.Audit.Search(q)
+	switch {
+	case errors.Is(err, audit.ErrBadQuery):
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+	case err != nil:
+		s.Log.Error("audit search failed", "err", err)
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "audit search failed")
+	default:
+		if page.Events == nil {
+			page.Events = []audit.Event{}
+		}
+		writeJSON(w, http.StatusOK, page)
+	}
 }
 
 var errProtocol = errors.New("terminal protocol error")

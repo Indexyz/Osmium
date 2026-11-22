@@ -46,15 +46,38 @@ linux/amd64、Go 1.26 下的参考数据：
 ```sh
 go test -race ./...
 go test -short ./...          # 跳过端到端测试
-E2E_LOG=1 go test -run TestShellOverSharedTunnel -v ./internal/e2e/   # 输出日志与审计
+E2E_LOG=1 go test -run TestShellOverSharedTunnel -v ./internal/e2e/   # 同时把日志和审计事件输出到 stderr
 ```
 
 端到端测试（`internal/e2e`）需要 PATH 中有 `sshd`、`ssh`、`ssh-agent`、`ssh-add`。它会：
 - 以当前用户身份，在回环地址的随机端口上启动无特权 sshd；
-- 用进程内的假 step-ca（`internal/ca/catest`）签发证书；
+- 默认用进程内的假 step-ca（`internal/ca/catest`）签发证书，联调真实 step-ca 的测试见下文；
 - 原生模式测试会编译 `osmium` 二进制，走完 `login` → 浏览器确认 → `ssh` 的完整流程。
 
 测试不会改动系统里的 sshd，也不会读取开发者的 `~/.ssh`。覆盖的场景对应 [design/09-acceptance-tests.md](design/09-acceptance-tests.md)。
+
+### 与真实 step-ca 联调
+
+如果 PATH 中有 `step` 和 `step-ca`，`internal/e2e/stepca_test.go` 会在临时目录里 `step ca init` 一个独立 CA。它使用仓库中的 `web-user.tpl` 和 `deny-x509.tpl`，把 provisioner 时长设为 1 分钟，再用这个 CA 跑测试。如果 PATH 中没有这两个程序，相关测试会自动跳过。
+
+```sh
+nix shell nixpkgs#step-ca nixpkgs#step-cli -c go test -run StepCA -v ./internal/e2e/
+```
+
+覆盖的场景（已在 step-ca 0.30.2 和 step-cli 0.31.0 上通过）：
+- `TestStepCAInterop`：
+  - B01 测量有效期窗口，见下文；
+  - B05 用其他 CA 校验时拒绝；
+  - B06 拒绝签发主机证书、多 principal 证书和 X.509；
+  - B07 申请更长有效期时不会被批准；
+  - B10 一次性令牌不能重放。
+- `TestStepCACertExpiry`：B02、B03、B04、B12，约 64 秒。证书过期后，已建立的 SSH 连接仍可开新 channel，新的认证会被 sshd 拒绝。
+- `TestStepCAEndToEnd`：
+  - Web 终端完整流程；
+  - A05 跨主机拒绝；
+  - 原生 `osmium ssh`。
+
+B01 的测量结果：step-ca 默认把 `valid_after` 往前回拨 1 分钟，所以总区间是 120 秒，签发后剩余约 60 秒，见 [decisions.md](decisions.md) 的 O05。如果需要排查 CA 一侧的拒绝原因，加上 `E2E_LOG=1` 可以输出 step-ca 日志。
 
 ## 本地登录
 

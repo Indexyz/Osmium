@@ -102,6 +102,13 @@ type Sessions struct {
 	RevokeActive       *bool    `json:"revoke_active"`
 }
 
+// Audit configures the persistent audit log.
+type Audit struct {
+	Dir       string   `json:"dir"`       // dedicated directory, one JSONL file per UTC day
+	Retention Duration `json:"retention"` // 0 keeps files forever
+	Stdout    bool     `json:"stdout"`    // also mirror every event to stdout
+}
+
 // Server is the server configuration.
 type Server struct {
 	ServerID   string `json:"server_id"`
@@ -121,6 +128,7 @@ type Server struct {
 	SecureCookie *bool    `json:"secure_cookie"`
 	WebSession   Duration `json:"web_session_ttl"`
 
+	Audit    Audit    `json:"audit"`
 	CA       CA       `json:"ca"`
 	Sessions Sessions `json:"sessions"`
 	Smux     Smux     `json:"smux"`
@@ -179,6 +187,9 @@ func LoadServer(path string) (*Server, error) {
 	}
 	if c.AgentTLSCert == "" || c.AgentTLSKey == "" || c.AgentClientCA == "" {
 		return nil, errors.New("config: agent_tls_cert, agent_tls_key and agent_client_ca are required (Agent mTLS)")
+	}
+	if c.Audit.Dir == "" {
+		return nil, errors.New("config: audit.dir is required")
 	}
 	if c.OIDC == nil && !c.DevLogin {
 		return nil, errors.New("config: oidc is required (dev_login is for local development only)")

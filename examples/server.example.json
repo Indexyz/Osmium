@@ -19,6 +19,12 @@
   },
   "web_session_ttl": "8h",
 
+  "audit": {
+    "dir": "/var/lib/osmium/audit",
+    "retention": "2160h",
+    "stdout": false
+  },
+
   "ca": {
     "url": "https://ca.example.com",
     "root_ca_file": "/etc/osmium/step-root.pem",

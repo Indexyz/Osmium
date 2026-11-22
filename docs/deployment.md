@@ -9,6 +9,8 @@
 - SSH 模板用 [web-user.tpl](design/config/step-ca/web-user.tpl)，只允许一个 principal，只带 `permit-pty`；
 - X.509 模板用 [deny-x509.tpl](design/config/step-ca/deny-x509.tpl)，禁止签发 X.509。
 
+step-ca 默认会把证书的 `valid_after` 往前回拨 1 分钟（`ca.json` 中的 `authority.backdate`），所以一张“1 分钟”的证书，总有效区间是 120 秒，签发后剩余约 60 秒。如果需要更严格的窗口，可以把它调小，例如改成 `"5s"`。这个设置对整个 CA 生效，会影响该 CA 签发的所有证书。
+
 Server 需要以下文件（对应 `ca.*` 配置项）：
 - 该 provisioner 的加密 JWK 及其密码文件；
 - step-ca 根证书；
@@ -61,4 +63,16 @@ osmium-agent -c /etc/osmium-agent/agent.json  # 目标主机上运行，参考 e
 - Server 的 Web 监听（`listen`）建议放在 HTTPS 反向代理之后，或直接配置 `tls_cert` / `tls_key`。
 - `public_url` 必须是浏览器实际访问的地址，用于 Origin 校验。
 - Agent 监听（`agent_listen`）强制 mTLS。
-- 审计日志以 JSON 输出到 stdout。
+- 审计日志写入 `audit.dir`（必填），见下文“审计”。
+
+## 审计
+
+审计事件只包含元数据：用户、动作、结果、主机/登录名、会话 ID、策略版本、证书序列号和密钥指纹，不包含令牌、ticket、私钥或终端内容。
+
+- 存储：`audit.dir` 下每个 UTC 日一个文件 `YYYY-MM-DD.jsonl`，每行一个事件，只追加。目录权限 0700，文件 0600。该目录应只用于审计，不要与其他数据混放。
+- 保留：`audit.retention`（例如 `"2160h"`，即 90 天）到期后删除整日文件；不设置则永久保留。
+- 转发：`audit.stdout: true` 会同时把每条事件写到 stdout，便于 journald 或日志采集器收集。也可以直接采集 `audit.dir` 下的文件。
+- 查询：管理员使用 `GET /api/v1/admin/audit`。参数有 `from`、`to`（RFC 3339 格式，默认最近 24 小时），`action`、`actor`、`session_id`、`target`（精确匹配），`limit`（1–1000，默认 100），以及 `cursor`（上一页返回的 `next_cursor`）。结果按时间升序排列。
+- 限制：只支持单副本和本地磁盘，也不做防篡改。如需合规留存，请把文件转发到只追加的外部存储。
+
+step-ca 自身的日志会以 info 或 warn 级别记录一次性令牌（OTT）和完整证书。OTT 是一次性的，有效期也很短，但仍应限制 step-ca 日志的访问权限。
