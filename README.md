@@ -18,6 +18,13 @@ osmium login --server https://ssh.example.com
 osmium ssh ops@host-123
 ```
 
+容器镜像（发布于 GHCR，支持 `linux/amd64` 与 `linux/arm64`）：
+
+```sh
+docker pull ghcr.io/indexyz/osmium:latest
+docker pull ghcr.io/indexyz/osmium-agent:latest
+```
+
 配置示例见 [`examples/`](examples/)，完整步骤见 [部署文档](docs/deployment.md)。
 
 ## 文档

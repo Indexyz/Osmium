@@ -1,0 +1,14 @@
+.git
+.github
+.changeset
+dev
+node_modules
+web/node_modules
+web/dist
+docs
+examples
+*.md
+osmium
+osmium-agent
+osmium.exe
+osmium-agent.exe

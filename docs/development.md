@@ -11,6 +11,28 @@ go build -o osmium ./cmd/osmium   # 调试构建（保留符号表，体积大�
 ./osmium --help
 ```
 
+### 容器构建
+
+仓库根目录的 [Dockerfile](../Dockerfile) 采用多阶段构建（Node 构建前端 + Go 原生交叉编译 + `distroless:nonroot` 运行时），提供 `server`（默认）与 `agent` 两个 target：
+
+```sh
+docker build -t osmium:dev --target server .
+docker build -t osmium-agent:dev --target agent .
+```
+
+### 版本管理与发布（Changesets）
+
+本仓库使用 [Changesets](https://changesets.dev/) 管理语义化版本与 `CHANGELOG.md`（配置位于 `.changeset/config.json`）：
+
+```sh
+npm install           # 安装根目录 Changesets CLI
+npm run changeset     # 新增一条变更记录（.changeset/*.md），随 PR 一并提交
+```
+
+合并 PR 到 `main` 后，`.github/workflows/release.yml` 会自动维护 **Version Packages** PR；合并该 PR 后自动打 `vX.Y.Z` tag、创建 GitHub Release、推送 `ghcr.io/indexyz/osmium` 与 `ghcr.io/indexyz/osmium-agent` 多架构镜像，并上传多平台二进制归档与校验和。
+
+> GitHub 仓库需在 **Settings → Actions → General → Workflow permissions** 中开启 **Read and write permissions** 与 **Allow GitHub Actions to create and approve pull requests**，否则 `changesets/action` 无法自动创建发版 PR。
+
 前端开发（在 `web/` 目录下，使用 Vite 热更新并代理 `/api` 和 `/auth` 到本地 `127.0.0.1:8080`）：
 
 ```sh

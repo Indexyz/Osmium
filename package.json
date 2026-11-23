@@ -1,0 +1,15 @@
+{
+  "name": "osmium",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Web & Native SSH access system powered by step-ca, smux v2, React and ghostty-web",
+  "scripts": {
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "changeset tag"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.5.1",
+    "@changesets/cli": "^2.29.8"
+  }
+}
