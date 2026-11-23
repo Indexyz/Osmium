@@ -1,0 +1,129 @@
+version: 2
+
+project_name: osmium
+
+env:
+  - CGO_ENABLED=0
+
+before:
+  hooks:
+    - npm --prefix web run build
+
+builds:
+  - id: osmium
+    main: ./cmd/osmium
+    binary: osmium
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: osmium-agent
+    main: ./cmd/osmium-agent
+    binary: osmium-agent
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+
+archives:
+  - id: osmium
+    ids:
+      - osmium
+    name_template: >-
+      osmium_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+
+  - id: osmium-agent
+    ids:
+      - osmium-agent
+    name_template: >-
+      osmium-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}
+    formats:
+      - tar.gz
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+dockers_v2:
+  - id: osmium
+    ids:
+      - osmium
+    dockerfile: deploy/docker/osmium.goreleaser.Dockerfile
+    images:
+      - >-
+        ghcr.io/{{ if index .Env "GHCR_OWNER" }}{{ tolower .Env.GHCR_OWNER }}{{ else }}indexyz{{ end }}/osmium
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .IsSnapshot }}{{ .Tag }}{{ end }}"
+      - "{{ if and (not .IsSnapshot) (not .Prerelease) }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if and (not .IsSnapshot) (not .Prerelease) }}latest{{ end }}"
+      - "sha-{{ .ShortCommit }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: "osmium"
+      org.opencontainers.image.description: "Osmium Web & Native SSH access server"
+      org.opencontainers.image.source: >-
+        https://github.com/{{ if index .Env "GITHUB_REPOSITORY" }}{{ .Env.GITHUB_REPOSITORY }}{{ else }}Indexyz/Osmium{{ end }}
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+
+  - id: osmium-agent
+    ids:
+      - osmium-agent
+    dockerfile: deploy/docker/osmium-agent.goreleaser.Dockerfile
+    images:
+      - >-
+        ghcr.io/{{ if index .Env "GHCR_OWNER" }}{{ tolower .Env.GHCR_OWNER }}{{ else }}indexyz{{ end }}/osmium-agent
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .IsSnapshot }}{{ .Tag }}{{ end }}"
+      - "{{ if and (not .IsSnapshot) (not .Prerelease) }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if and (not .IsSnapshot) (not .Prerelease) }}latest{{ end }}"
+      - "sha-{{ .ShortCommit }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: "osmium-agent"
+      org.opencontainers.image.description: "Standalone host reverse-tunnel Agent for Osmium"
+      org.opencontainers.image.source: >-
+        https://github.com/{{ if index .Env "GITHUB_REPOSITORY" }}{{ .Env.GITHUB_REPOSITORY }}{{ else }}Indexyz/Osmium{{ end }}
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+
+changelog:
+  disable: true
+
+release:
+  mode: keep-existing
+  replace_existing_artifacts: true
+  prerelease: auto

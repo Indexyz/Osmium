@@ -20,18 +20,20 @@ docker build -t osmium:dev --target server .
 docker build -t osmium-agent:dev --target agent .
 ```
 
-### 版本管理与发布（Changesets）
+### 版本管理与发布（Changesets + GoReleaser）
 
-本仓库使用 [Changesets](https://changesets.dev/) 管理语义化版本与 `CHANGELOG.md`（配置位于 `.changeset/config.json`）：
+本仓库使用 [Changesets](https://changesets.dev/) 管理语义化版本与 `CHANGELOG.md`（配置位于 `.changeset/config.json`），并由 [GoReleaser](https://goreleaser.com/)（配置位于 `.goreleaser.yaml`）统一构建多平台二进制归档、校验和以及 GHCR 多架构容器镜像（`dockers_v2`）：
 
 ```sh
-npm install           # 安装根目录 Changesets CLI
-npm run changeset     # 新增一条变更记录（.changeset/*.md），随 PR 一并提交
+npm install                              # 安装根目录 Changesets CLI
+npm run changeset                        # 新增一条变更记录（.changeset/*.md），随 PR 一并提交
+goreleaser release --snapshot --clean    # 本地演练发布打包（自动构建 web/dist 与多平台产物，不推送远端）
 ```
 
-合并 PR 到 `main` 后，`.github/workflows/release.yml` 会自动维护 **Version Packages** PR；合并该 PR 后自动打 `vX.Y.Z` tag、创建 GitHub Release、推送 `ghcr.io/indexyz/osmium` 与 `ghcr.io/indexyz/osmium-agent` 多架构镜像，并上传多平台二进制归档与校验和。
+合并 PR 到 `main` 后，`.github/workflows/release.yml` 会自动维护 **Version Packages** PR；合并该 PR 后自动打 `vX.Y.Z` tag、创建 GitHub Release，随后由 GoReleaser 一次性完成 `osmium` / `osmium-agent` 多平台归档上传以及 `ghcr.io/indexyz/osmium` 与 `ghcr.io/indexyz/osmium-agent` 多架构镜像推送。
 
-> GitHub 仓库需在 **Settings → Actions → General → Workflow permissions** 中开启 **Read and write permissions** 与 **Allow GitHub Actions to create and approve pull requests**，否则 `changesets/action` 无法自动创建发版 PR。
+> - GitHub 仓库需在 **Settings → Actions → General → Workflow permissions** 中开启 **Read and write permissions** 与 **Allow GitHub Actions to create and approve pull requests**，否则 `changesets/action` 无法自动创建发版 PR。
+> - 仓库根目录 [Dockerfile](../Dockerfile) 仍保留完整的自包含多阶段构建（方便本地直接 `docker build`），GoReleaser 发布镜像则使用 `deploy/docker/*.goreleaser.Dockerfile` 复用已交叉编译好的静态二进制。
 
 前端开发（在 `web/` 目录下，使用 Vite 热更新并代理 `/api` 和 `/auth` 到本地 `127.0.0.1:8080`）：
 

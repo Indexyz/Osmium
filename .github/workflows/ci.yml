@@ -60,8 +60,45 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/osmium ./cmd/osmium
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/osmium-agent ./cmd/osmium-agent
 
+  goreleaser:
+    name: GoReleaser Snapshot Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Web UI dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check GoReleaser config & snapshot build
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean
+        env:
+          GHCR_OWNER: ${{ github.repository_owner }}
+
   docker:
-    name: Docker Build Check
+    name: Standalone Dockerfile Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

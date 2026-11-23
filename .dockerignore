@@ -1,7 +1,9 @@
 .git
 .github
 .changeset
+deploy
 dev
+dist
 node_modules
 web/node_modules
 web/dist
