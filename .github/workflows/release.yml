@@ -7,6 +7,11 @@ on:
     tags:
       - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build and publish (e.g. v0.1.0)'
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -56,8 +61,9 @@ jobs:
     needs: [changeset]
     if: |
       always() &&
+      !cancelled() &&
       (needs.changeset.result == 'success' || needs.changeset.result == 'skipped') &&
-      (startsWith(github.ref, 'refs/tags/v') || needs.changeset.outputs.published == 'true')
+      (startsWith(github.ref, 'refs/tags/v') || needs.changeset.outputs.published == 'true' || (github.event_name == 'workflow_dispatch' && inputs.tag != ''))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -71,16 +77,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Resolve tag and version
         id: meta
         env:
           GITHUB_REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
           PUBLISHED_PACKAGES: ${{ needs.changeset.outputs.publishedPackages }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG#refs/tags/}"
+            TAG="v${TAG#v}"
+            VERSION="${TAG#v}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
             VERSION="${TAG#v}"
           else
@@ -102,7 +114,7 @@ jobs:
           echo "Resolved release tag=${TAG} version=${VERSION} minor=${MAJOR}.${MINOR} prerelease=${PRERELEASE}"
 
       - name: Ensure GitHub Release exists for manual tag pushes
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
@@ -141,6 +153,7 @@ jobs:
   docker:
     name: Build & Push GHCR Images
     needs: [resolve-release]
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.resolve-release.outputs.tag != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -198,6 +211,7 @@ jobs:
   binaries:
     name: Build & Upload Release Binaries
     needs: [resolve-release]
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.resolve-release.outputs.tag != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
