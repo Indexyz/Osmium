@@ -6,7 +6,7 @@
 
 按 [design/04-ca-integration.md](design/04-ca-integration.md) 新建一个专用的 JWK provisioner，例如命名为 `web-ssh`：
 - 证书时长取 [provisioner.fragment.json](design/config/step-ca/provisioner.fragment.json)；
-- SSH 模板用 [web-user.tpl](design/config/step-ca/web-user.tpl)，只允许一个 principal，只带 `permit-pty`；
+- SSH 模板用 [web-user.tpl](design/config/step-ca/web-user.tpl)，只允许一个 principal，只带 `permit-pty`；如果启用了原生 SSH 模式且目标 `sshd` 可被内网直连，建议改用 [web-user-loopback.tpl](design/config/step-ca/web-user-loopback.tpl)（锁定 `criticalOptions.source-address` 为 `127.0.0.1/32,::1/128`），并在 Server 配置中设置 `"ca": { "required_source_address": "127.0.0.1/32,::1/128" }`，防止 60 秒证书被用于绕过隧道直连 `sshd`；
 - X.509 模板用 [deny-x509.tpl](design/config/step-ca/deny-x509.tpl)，禁止签发 X.509。
 
 step-ca 默认会把证书的 `valid_after` 往前回拨 1 分钟（`ca.json` 中的 `authority.backdate`），所以一张“1 分钟”的证书，总有效区间是 120 秒，签发后剩余约 60 秒。如果需要更严格的窗口，可以把它调小，例如改成 `"5s"`。这个设置对整个 CA 生效，会影响该 CA 签发的所有证书。
@@ -44,10 +44,11 @@ osmium dev pki -o dev/pki --server-hosts localhost,127.0.0.1 --agents agent-123
   - `policy_labels`；
   - 绑定的 Agent。
 - `grants`：描述谁可以以哪些登录名访问哪些主机。主体可以是用户 ID、`issuer + subject` 或组；主机可以按 ID 或标签选择。
-- `admins`：管理员可以关闭他人的会话，但不能观看。
+- `admins`：管理员可以查看在线 Agent、审计日志和 CLI 令牌元数据，关闭他人会话，以及集中吊销单条 CLI 令牌（`POST /api/v1/admin/cli-tokens/{token_id}/revoke`）或一键吊销指定用户的全部登录态与活跃会话（`POST /api/v1/admin/users/{user_id}/revoke`），但不能观看他人终端。
+- `disabled_users`：按 `user_id`、`issuer + subject` 或 `group` 禁用用户，优先级高于 `admins` 和 `grants`。
 
 修改策略文件后向 Server 发送 `SIGHUP` 即可热加载：
-- 授权被撤销的活跃会话会立即关闭，可通过 `sessions.revoke_active` 关闭这一行为；
+- 授权被撤销或被加入 `disabled_users` 的用户的活跃会话会立即关闭（可通过 `sessions.revoke_active` 关闭对普通授权撤销的踢出行为），且被禁用用户的服务端 Web 会话与 CLI 令牌会立即清除；
 - 不需要改动主机。
 
 ## 5. 启动
@@ -60,9 +61,10 @@ osmium-agent -c /etc/osmium-agent/agent.json  # 目标主机上运行，参考 e
 - 目标主机上应部署独立构建的 `osmium-agent`（`make agent`，交叉编译用 `make agent GOOS=linux GOARCH=arm64`）。它只包含 Agent 所需的代码，体积和内存占用都更小，适合性能和内存都有限的边缘设备。主程序里的 `osmium agent` 与它功能相同。
 - 内存非常紧张的设备上，可以在 systemd unit 中设置 `Environment=GOMEMLIMIT=24MiB`，让 GC 在接近这个上限时更积极地回收。也可以在 `agent.json` 的 `smux` 中调小 `max_receive_buffer`（默认 4 MiB）和 `max_stream_buffer`（默认 256 KiB），以限制隧道缓冲。注意 smux 参数必须与 Server 配置完全一致。
 
-- Server 的 Web 监听（`listen`）建议放在 HTTPS 反向代理之后，或直接配置 `tls_cert` / `tls_key`。
+- Server 的 Web 监听（`listen`）建议放在 HTTPS 反向代理之后，或直接配置 `tls_cert` / `tls_key`。进程存活检查可使用无认证只读接口 `GET /healthz`。
 - `public_url` 必须是浏览器实际访问的地址，用于 Origin 校验。
 - Agent 监听（`agent_listen`）强制 mTLS。
+- 稳定性限流参数：`max_pending_streams_per_agent`（默认 8，建议保持低于目标机 `sshd` 的 `MaxStartups`）、`sessions.max_concurrent_signs`（默认 16，保护 step-ca）与 `sessions.idle_timeout`（示例 `30m`，自动关闭闲置会话）。
 - 审计日志写入 `audit.dir`（必填），见下文“审计”。
 
 ## 6. 审计

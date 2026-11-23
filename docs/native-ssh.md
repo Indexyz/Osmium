@@ -28,18 +28,19 @@ osmium logout                                    # 在 Server 端吊销并删除
    
    令牌与 Web 会话相互独立，有效期等于 `web_session_ttl`，Server 端只保存它的哈希。
 2. **连接**：`osmium ssh` 依次执行以下步骤。
-   1. 生成一次性的 ed25519 密钥，调用 `POST /api/v1/native-sessions`，只提交 `host_id`、`login_user` 和公钥。Server 做授权检查，同一把公钥不能重复使用。
-   2. 打开 `GET /api/v1/ssh-sessions/{id}/tunnel`。这是 WebSocket，子协议为 `osmium-native-ssh.v1`，只接受 Bearer 认证。
+   1. 生成一次性的 ed25519 密钥，凭 CLI Bearer 令牌调用 `POST /api/v1/native-sessions`（仅接受 Bearer，拒绝浏览器 Cookie），只提交 `host_id`、`login_user` 和公钥。Server 做授权检查，同一把公钥不能重复使用。
+   2. 打开 `GET /api/v1/ssh-sessions/{id}/tunnel`。这是 WebSocket，子协议为 `osmium-native-ssh.v1`，只接受 Bearer 认证，入站单帧大小限制为 1 MiB 且强制二进制帧。
    3. Server 让 Agent 打开 stream，Agent 确认后再向 step-ca 签发证书，然后再复核一次授权，最后发送 `native.ready`，内容是证书和策略里登记的主机公钥。
    4. CLI 把私钥和证书加入 `SSH_AUTH_SOCK` 指向的 ssh-agent，有效期约 90 秒，到期由 agent 自动删除，ssh 退出时 CLI 也会主动删除。
    5. CLI 用临时 known_hosts 启动本机 `ssh`，参数包括 `StrictHostKeyChecking=yes`、`HostKeyAlias`、`IdentitiesOnly=yes` 和 `ProxyCommand`。`ProxyCommand` 经由 `osmium proxy-connect` 把字节转发到隧道上。
-3. **结束**：ssh 退出、管理员关闭会话、授权被撤销、达到最长时长或 Agent 断开，任何一种情况都只关闭本会话自己的 stream。
+3. **结束**：ssh 退出（支持客户端半关闭后有界排空远端末尾输出）、空闲超时、管理员关闭会话/集中吊销用户、授权被撤销、达到最长时长或 Agent 断开，任何一种情况都只关闭本会话自己的 stream。
 
-## 安全性质
+## 安全性质与边界
 
 - 私钥不离开用户本机，每次连接都换一把新密钥。证书只有一个 principal，有效期约 60 秒；证书过期不影响已经建立的连接。
 - 主机公钥必须与策略登记的一致，不读用户的 `known_hosts`，也不会写入。
-- 隧道只接受 Bearer 令牌，浏览器无法凭 Cookie 打开它。原生会话也不能以 Web 终端的方式附加。
+- 原生会话创建（`/api/v1/native-sessions`）与隧道（`/tunnel`）均只接受 Bearer 令牌，浏览器无法凭 Cookie 触发。原生会话也不能以 Web 终端的方式附加。
 - 原生模式下 Server 看不到会话明文，审计只记录元数据：用户、主机、登录名、证书序列号、密钥指纹和时间。
-- 证书只带 `permit-pty`，因此端口转发、agent 转发和 X11 转发都会被 sshd 拒绝。
-- 不使用 ssh-agent 时（`--no-agent`，或者没有 `SSH_AUTH_SOCK`），私钥写入权限为 0700 的临时目录，ssh 退出后删除。
+- 证书模板只带 `permit-pty`，因此端口转发、agent 转发和 X11 转发都会被 sshd 拒绝。**注意边界**：`permit-pty` 并不阻止 `exec`、同一条加密 SSH transport 内的多路复用 channel，或目标机 `sshd` 已启用的 `sftp` 子系统；若合规要求彻底禁用这些能力或强制录屏审计，应评估关闭原生模式（见 [decisions.md](decisions.md)）。
+- **防止 60 秒证书内网旁路直连**：原生模式会将短期证书发给用户本机；若目标机 22 端口在内网直接可达，建议在 step-ca 中采用 [web-user-loopback.tpl](design/config/step-ca/web-user-loopback.tpl) 将证书 `source-address` 锁定为 `127.0.0.1/32,::1/128`，并在 Server 中配置 `ca.required_source_address` 强制校验。
+- 不使用 ssh-agent 时（`--no-agent`，或者没有 `SSH_AUTH_SOCK`），私钥写入权限为 0700 的临时目录，ssh 退出后删除。当前原生 CLI 实现依赖 Unix domain socket，暂不支持 Windows 本机 OpenSSH。

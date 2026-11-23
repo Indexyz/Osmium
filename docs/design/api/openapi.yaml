@@ -1,11 +1,55 @@
 openapi: 3.1.0
 info:
-  title: Web SSH control API (Go + smux handoff)
-  version: 0.2.0
-  description: 设计草案，不是已部署接口；Agent WebSocket 协议以 docs/05 和 schema 为准。
+  title: Osmium Web & Native SSH Control API
+  version: 0.3.0
+  description: >-
+    与当前 Server 实现对齐的 HTTP API 契约；Agent WebSocket 控制/数据通道以
+    docs/design/05-protocols.md 与 control/stream/terminal schema 为准。
 security:
 - webSession: []
+- cliBearer: []
 paths:
+  /healthz:
+    get:
+      operationId: healthz
+      summary: 无认证进程存活检查，不暴露任何内部拓扑或凭据
+      security: []
+      responses:
+        '200':
+          description: 进程正常
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  status:
+                    const: ok
+                required:
+                - status
+  /api/v1/me:
+    get:
+      operationId: getMe
+      summary: 返回当前登录用户身份、管理员标识及 Web 会话的 CSRF token
+      responses:
+        '200':
+          description: 当前登录态信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401': &err401
+          description: 未登录或凭证已失效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403': &err403
+          description: 无权限或用户已被禁用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /api/v1/hosts:
     get:
       operationId: listHosts
@@ -19,7 +63,7 @@ paths:
           type: array
           items:
             type: string
-        description: 重复 label=key=value，以 AND 组合；语法为草案
+        description: 重复 label=key=value，以 AND 组合
       responses:
         '200':
           description: 可见主机集合
@@ -35,45 +79,44 @@ paths:
                       $ref: '#/components/schemas/Host'
                 required:
                 - items
-        '400': &id001
+        '400': &err400
           description: 请求不合法
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '401': &id002
-          description: 未登录
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '403': &id003
-          description: 无权限
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409': &id004
-          description: 状态或幂等冲突
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503': &id005
-          description: 主机/隧道/CA 不可用
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+        '401': *err401
+        '403': *err403
   /api/v1/ssh-sessions:
+    get:
+      operationId: listSSHSessions
+      summary: 列出当前用户可见（本人或管理员可见全部）的会话视图
+      responses:
+        '200':
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SSHSession'
+                required:
+                - items
+        '401': *err401
+        '403': *err403
     post:
       operationId: createSSHSession
-      summary: 创建待绑定终端的会话资源；不立即代表 SSH 已完成
+      summary: 创建待绑定浏览器终端的 Web 会话资源；不立即代表 SSH 已完成
       parameters:
-      - &id007
+      - &csrfHeader
         name: X-CSRF-Token
         in: header
-        required: true
+        required: false
+        description: Cookie 认证写操作必填；Bearer 认证可省略
         schema:
           type: string
           minLength: 1
@@ -103,18 +146,52 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SSHSession'
-        '400': *id001
-        '401': *id002
-        '403': *id003
-        '409': *id004
-        '503': *id005
+        '400': *err400
+        '401': *err401
+        '403': *err403
+        '409': &err409
+          description: 状态、并发配额或幂等冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': &err503
+          description: 主机/隧道/CA 不可用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/native-sessions:
+    post:
+      operationId: createNativeSession
+      summary: 创建原生 OpenSSH 客户端会话（仅接受 CLI Bearer 令牌）
+      security:
+      - cliBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNativeSession'
+      responses:
+        '201':
+          description: 新原生会话资源（含 tunnel_path）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SSHSession'
+        '400': *err400
+        '401': *err401
+        '403': *err403
+        '409': *err409
+        '503': *err503
   /api/v1/ssh-sessions/{session_id}:
     parameters:
-    - &id006
+    - &sessionIdParam
       name: session_id
       in: path
       required: true
-      schema: &id008
+      schema: &idSchema
         type: string
         minLength: 1
         maxLength: 128
@@ -124,58 +201,230 @@ paths:
       summary: 按归属/管理员权限返回状态
       responses:
         '200':
-          description: 状态
+          description: 会话状态
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SSHSession'
-        '404':
+        '400': *err400
+        '401': *err401
+        '403': *err403
+        '404': &err404
           description: 不可见或不存在
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '400': *id001
-        '401': *id002
-        '403': *id003
-        '409': *id004
-        '503': *id005
   /api/v1/ssh-sessions/{session_id}/close:
     parameters:
-    - *id006
+    - *sessionIdParam
     post:
       operationId: closeSSHSession
       summary: 幂等关闭该会话，不关闭整个 Agent 的 smux Session
       parameters:
-      - *id007
+      - *csrfHeader
       responses:
         '202':
-          description: 接受关闭，状态可继续查询
+          description: 接受关闭
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SSHSession'
-        '400': *id001
-        '401': *id002
-        '403': *id003
-        '409': *id004
-        '503': *id005
+        '400': *err400
+        '401': *err401
+        '403': *err403
+        '404': *err404
   /api/v1/ssh-sessions/{session_id}/terminal:
     parameters:
-    - *id006
+    - *sessionIdParam
     get:
       operationId: attachTerminal
-      summary: WebSocket Upgrade；须验证 Origin、归属、单消费者和 session 状态
-      description: Subprotocol web-ssh-terminal.v1。帧定义见 terminal.schema.json；OpenAPI
-        不表示完整 WebSocket 协议。
+      summary: Web 终端 WebSocket Upgrade（仅限会话归属用户且非 Bearer，须校验 Origin）
+      description: Subprotocol web-ssh-terminal.v1。帧定义见 terminal.schema.json。
+      security:
+      - webSession: []
       responses:
         '101':
           description: WebSocket 已升级，等待 terminal.state=active 后才可输入
-        '400': *id001
-        '401': *id002
-        '403': *id003
-        '409': *id004
-        '503': *id005
+        '401': *err401
+        '403': *err403
+        '404': *err404
+        '409': *err409
+  /api/v1/ssh-sessions/{session_id}/tunnel:
+    parameters:
+    - *sessionIdParam
+    get:
+      operationId: attachNativeTunnel
+      summary: 原生 SSH 隧道 WebSocket Upgrade（仅限 CLI Bearer 令牌与会话归属用户）
+      description: >-
+        Subprotocol osmium-native-ssh.v1。先发 text 帧 native.state / native.ready，
+        之后双向传 binary 原始 SSH 字节（入站单帧上限 1 MiB），结束时发 native.exit。
+      security:
+      - cliBearer: []
+      responses:
+        '101':
+          description: WebSocket 已升级
+        '400': *err400
+        '401': *err401
+        '403': *err403
+        '404': *err404
+        '409': *err409
+  /api/v1/cli/logout:
+    post:
+      operationId: cliLogout
+      summary: 吊销当前请求携带的 CLI Bearer 令牌
+      security:
+      - cliBearer: []
+      responses:
+        '204':
+          description: 已吊销
+        '400': *err400
+        '401': *err401
+  /api/v1/admin/agents:
+    get:
+      operationId: adminListAgents
+      summary: 管理员查看在线 Agent 状态、epoch 及流计数
+      responses:
+        '200':
+          description: 在线 Agent 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentInfo'
+                required:
+                - items
+        '401': *err401
+        '403': *err403
+  /api/v1/admin/audit:
+    get:
+      operationId: adminSearchAudit
+      summary: 管理员按时间范围和字段分页检索审计事件
+      parameters:
+      - name: from
+        in: query
+        schema:
+          type: string
+          format: date-time
+      - name: to
+        in: query
+        schema:
+          type: string
+          format: date-time
+      - name: user
+        in: query
+        schema:
+          type: string
+      - name: actor
+        in: query
+        schema:
+          type: string
+      - name: action
+        in: query
+        schema:
+          type: string
+      - name: session_id
+        in: query
+        schema:
+          type: string
+      - name: target
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 审计事件分页结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '400': *err400
+        '401': *err401
+        '403': *err403
+  /api/v1/admin/cli-tokens:
+    get:
+      operationId: adminListCLITokens
+      summary: 管理员列出所有未过期 CLI 令牌元数据（不含明文或哈希）
+      responses:
+        '200':
+          description: 令牌元数据列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CLITokenInfo'
+                required:
+                - items
+        '401': *err401
+        '403': *err403
+  /api/v1/admin/cli-tokens/{token_id}/revoke:
+    post:
+      operationId: adminRevokeCLIToken
+      summary: 管理员按元数据 ID 吊销指定 CLI 令牌
+      parameters:
+      - name: token_id
+        in: path
+        required: true
+        schema: *idSchema
+      - *csrfHeader
+      responses:
+        '200':
+          description: 吊销成功
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  revoked:
+                    $ref: '#/components/schemas/CLITokenInfo'
+                required:
+                - revoked
+        '400': *err400
+        '401': *err401
+        '403': *err403
+        '404': *err404
+  /api/v1/admin/users/{user_id}/revoke:
+    post:
+      operationId: adminRevokeUser
+      summary: 管理员集中吊销指定用户的全部 Web 会话、CLI 令牌并关闭其全部未结束 SSH 会话
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema: *idSchema
+      - *csrfHeader
+      responses:
+        '200':
+          description: 集中吊销结果统计
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRevokeResult'
+        '400': *err400
+        '401': *err401
+        '403': *err403
 components:
   securitySchemes:
     webSession:
@@ -183,6 +432,10 @@ components:
       in: cookie
       name: web_session
       description: 安全 HttpOnly cookie；写操作另做 CSRF，WebSocket 检查 Origin。
+    cliBearer:
+      type: http
+      scheme: bearer
+      description: 由 `osmium login` 经浏览器确认 + PKCE 换取的独立 CLI Bearer 令牌。
   schemas:
     Error:
       type: object
@@ -198,11 +451,45 @@ components:
       - code
       - message
       - request_id
+    User:
+      type: object
+      additionalProperties: false
+      properties:
+        id: *idSchema
+        issuer:
+          type: string
+        subject:
+          type: string
+        display_name:
+          type: string
+        groups:
+          type: array
+          items:
+            type: string
+      required:
+      - id
+      - issuer
+      - subject
+      - display_name
+    MeResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        is_admin:
+          type: boolean
+        csrf_token:
+          type: string
+          description: 仅 Cookie 登录态返回
+      required:
+      - user
+      - is_admin
     Host:
       type: object
       additionalProperties: false
       properties:
-        id: *id008
+        id: *idSchema
         display_name:
           type: string
         status:
@@ -231,10 +518,14 @@ components:
       type: object
       additionalProperties: false
       properties:
-        id: *id008
-        host_id: *id008
+        id: *idSchema
+        host_id: *idSchema
         login_user:
           type: string
+        mode:
+          enum:
+          - web
+          - native
         state:
           enum:
           - created
@@ -250,6 +541,10 @@ components:
           format: date-time
         terminal_path:
           type: string
+          description: 仅 mode=web 返回
+        tunnel_path:
+          type: string
+          description: 仅 mode=native 返回
         end_reason:
           type:
           - string
@@ -258,14 +553,14 @@ components:
       - id
       - host_id
       - login_user
+      - mode
       - state
       - created_at
-      - terminal_path
     CreateSession:
       type: object
       additionalProperties: false
       properties:
-        host_id: *id008
+        host_id: *idSchema
         login_user:
           type: string
           minLength: 1
@@ -289,3 +584,142 @@ components:
       - host_id
       - login_user
       - terminal
+    CreateNativeSession:
+      type: object
+      additionalProperties: false
+      properties:
+        host_id: *idSchema
+        login_user:
+          type: string
+          minLength: 1
+          maxLength: 64
+        public_key:
+          type: string
+          maxLength: 1024
+          description: 单次连接的临时 Ed25519/ECDSA 公钥（authorized_keys 格式）
+      required:
+      - host_id
+      - login_user
+      - public_key
+    AgentInfo:
+      type: object
+      additionalProperties: false
+      properties:
+        agent_id: *idSchema
+        host_id: *idSchema
+        connection_epoch:
+          type: integer
+          minimum: 1
+        data_ready:
+          type: boolean
+        agent_version:
+          type: string
+        reported_labels:
+          type: object
+          additionalProperties:
+            type: string
+        connected_at:
+          type: string
+          format: date-time
+        streams:
+          type: integer
+          minimum: 0
+        pending_streams:
+          type: integer
+          minimum: 0
+      required:
+      - agent_id
+      - host_id
+      - connection_epoch
+      - data_ready
+      - connected_at
+      - streams
+      - pending_streams
+    CLITokenInfo:
+      type: object
+      additionalProperties: false
+      properties:
+        id: *idSchema
+        user_id: *idSchema
+        display_name:
+          type: string
+        issuer:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - user_id
+      - created_at
+      - expires_at
+    UserRevokeResult:
+      type: object
+      additionalProperties: false
+      properties:
+        user_id: *idSchema
+        revoked_web_sessions:
+          type: integer
+          minimum: 0
+        revoked_cli_tokens:
+          type: integer
+          minimum: 0
+        closed_sessions:
+          type: integer
+          minimum: 0
+      required:
+      - user_id
+      - revoked_web_sessions
+      - revoked_cli_tokens
+      - closed_sessions
+    AuditEvent:
+      type: object
+      properties:
+        id:
+          type: string
+        time:
+          type: string
+          format: date-time
+        actor:
+          type: string
+        user:
+          type: string
+        action:
+          type: string
+        result:
+          type: string
+        target:
+          type: string
+        session_id:
+          type: string
+        attempt_id:
+          type: string
+        policy_revision:
+          type: integer
+        reason:
+          type: string
+        extra:
+          type: object
+      required:
+      - id
+      - time
+      - action
+      - result
+    AuditPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_cursor:
+          type: string
+      required:
+      - items

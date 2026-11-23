@@ -31,8 +31,11 @@ osmium CLI + ssh ───┘          ▲
 - **授权**完全在服务端，由策略文件定义（[design/03-authorization.md](design/03-authorization.md)）：
   - 客户端只能提交 `host_id`、`login_user`、终端尺寸，原生模式下再加一把公钥；
   - principal、TTL、标签和 CA 参数都由服务端决定；
-  - Agent 上报的标签只用于展示。
-- **复核**：创建会话、打开 stream、签发证书、激活这四个时刻都会重新检查授权。策略热加载后，被撤销的会话会立即关闭。
+  - Agent 上报的标签只用于展示；
+  - 支持策略级 `disabled_users`（优先于 `admins` 与 `grants`）及管理员集中吊销 API（清除 Web 会话、CLI 令牌并关闭活跃 SSH 会话）。
+- **复核与稳定性护栏**：
+  - 创建会话、打开 stream、签发证书、激活四个时刻均基于单次原子策略快照重新检查授权；策略热加载后，被撤销或禁用用户的活跃会话会立即关闭，被禁用用户的登录态也会即时清除；
+  - 每 Agent 独立限制未认证 `pending` stream 配额（`max_pending_streams_per_agent`，保护目标机 `sshd MaxStartups`），Server 全局限制并发 CA 签发数（`sessions.max_concurrent_signs`），并支持 `sessions.idle_timeout` 与无认证存活检查 `GET /healthz`。
 
 ## 会话状态
 
