@@ -196,6 +196,7 @@ func runEpoch(parent context.Context, o Options) error {
 		}
 	}()
 	binding := tunnel.Binding{HostID: w.HostID, Epoch: w.Epoch}
+	rejectSem := make(chan struct{}, 8)
 	go func() {
 		defer cancel()
 		for {
@@ -205,8 +206,17 @@ func runEpoch(parent context.Context, o Options) error {
 				return
 			}
 			if !reg.Reserve() {
-				handlers.Add(1)
-				go func() { defer handlers.Done(); tunnel.RejectStream(st, tunnel.CodeTooManyStreams, 2*time.Second) }()
+				select {
+				case rejectSem <- struct{}{}:
+					handlers.Add(1)
+					go func() {
+						defer handlers.Done()
+						defer func() { <-rejectSem }()
+						tunnel.RejectStream(st, tunnel.CodeTooManyStreams, 2*time.Second)
+					}()
+				default:
+					_ = st.Close()
+				}
 				continue
 			}
 			handlers.Add(1)

@@ -114,6 +114,7 @@ func runServer(cfgPath string, log *slog.Logger) error {
 		JWKFile: cfg.CA.JWKFile, JWKPasswordFile: cfg.CA.JWKPasswordFile, Audience: cfg.CA.Audience,
 		SignPath: cfg.CA.SignPath, ValidBefore: cfg.CA.ValidBefore, Timeout: cfg.CA.Timeout.D(),
 		UserCAPublicKeys: caKeys, MaxLifetime: cfg.CA.MaxCertLifetime.D(), AllowedExts: cfg.CA.AllowedExtensions,
+		RequiredSourceAddress: cfg.CA.RequiredSourceAddress,
 	})
 	if err != nil {
 		return err
@@ -121,7 +122,8 @@ func runServer(cfgPath string, log *slog.Logger) error {
 
 	hub := agenthub.New(agenthub.Config{
 		ServerID: cfg.ServerID, Mux: cfg.Smux.Mux(), TicketTTL: cfg.TicketTTL.D(),
-		HeartbeatTimeout: cfg.HeartbeatTimeout.D(), StreamOpen: cfg.StreamOpen.D(), MaxStreams: cfg.MaxStreams,
+		HeartbeatTimeout: cfg.HeartbeatTimeout.D(), StreamOpen: cfg.StreamOpen.D(),
+		MaxStreams: cfg.MaxStreams, MaxPendingStreams: cfg.MaxPendingStreams,
 	}, store, aud, log)
 	revoke := true
 	if cfg.Sessions.RevokeActive != nil {
@@ -129,8 +131,9 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	}
 	mgr := sessions.NewManager(sessions.Config{
 		AttachTimeout: cfg.Sessions.AttachTimeout.D(), SSHHandshake: cfg.Sessions.SSHHandshake.D(),
-		MaxSessionDuration: cfg.Sessions.MaxSessionDuration.D(), MaxPerUser: cfg.Sessions.MaxPerUser,
-		MaxTotal: cfg.Sessions.MaxTotal, RevokeActive: revoke,
+		MaxSessionDuration: cfg.Sessions.MaxSessionDuration.D(), IdleTimeout: cfg.Sessions.IdleTimeout.D(),
+		MaxPerUser: cfg.Sessions.MaxPerUser, MaxTotal: cfg.Sessions.MaxTotal,
+		MaxConcurrentSigns: cfg.Sessions.MaxConcurrentSigns, RevokeActive: revoke,
 	}, store, hub, signer, aud, log)
 
 	pub, err := url.Parse(cfg.PublicURL)
@@ -160,6 +163,13 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	store.OnChange(func(snap *authz.Snapshot) {
+		webN, cliN := auth.RevokeMatching(snap.IsDisabled)
+		if webN > 0 || cliN > 0 {
+			log.Info("revoked credentials for disabled users after policy reload", "revision", snap.Revision, "web_sessions", webN, "cli_tokens", cliN)
+			aud.Record(audit.Event{Actor: "system", Action: "policy.disable_revoke", Result: "ok", Revision: snap.Revision, Extra: map[string]any{"web_sessions": webN, "cli_tokens": cliN}})
+		}
+	})
 
 	srv := &server.Server{Store: store, Hub: hub, Sessions: mgr, Auth: auth, Audit: aud, Log: log, AllowedOrigins: []string{pub.Scheme + "://" + pub.Host}}
 

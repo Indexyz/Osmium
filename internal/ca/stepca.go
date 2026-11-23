@@ -48,10 +48,11 @@ type StepConfig struct {
 	Audience         string // default URL + "/1.0/ssh/sign"
 	SignPath         string // default "/1.0/ssh/sign"
 	ValidBefore      string // optional; passed to step-ca as validBefore (e.g. "60s")
-	Timeout          time.Duration
-	UserCAPublicKeys []string // authorized_keys lines of the trusted SSH User CA
-	MaxLifetime      time.Duration
-	AllowedExts      []string
+	Timeout               time.Duration
+	UserCAPublicKeys      []string // authorized_keys lines of the trusted SSH User CA
+	MaxLifetime           time.Duration
+	AllowedExts           []string
+	RequiredSourceAddress string // optional critical option source-address, e.g. "127.0.0.1/32,::1/128"
 }
 
 // StepCA is a Signer backed by step-ca.
@@ -111,7 +112,7 @@ func NewStepCA(cfg StepConfig) (*StepCA, error) {
 		}
 		tlsCfg.RootCAs = pool
 	}
-	v, err := NewVerifier(cfg.UserCAPublicKeys, cfg.MaxLifetime, cfg.AllowedExts)
+	v, err := NewVerifierWithSourceAddress(cfg.UserCAPublicKeys, cfg.MaxLifetime, cfg.AllowedExts, cfg.RequiredSourceAddress)
 	if err != nil {
 		return nil, err
 	}
@@ -299,18 +300,26 @@ func DecodeCert(b64 string) (*ssh.Certificate, error) {
 
 // Verifier checks a returned certificate against what was requested.
 type Verifier struct {
-	cas         []ssh.PublicKey
-	maxLifetime time.Duration
-	allowedExts []string
+	cas                []ssh.PublicKey
+	maxLifetime        time.Duration
+	allowedExts        []string
+	requiredSourceAddr string
 }
 
 // NewVerifier builds a Verifier. maxLifetime bounds ValidBefore-now (default
 // 5m) and allowedExts defaults to ["permit-pty"].
 func NewVerifier(caKeys []string, maxLifetime time.Duration, allowedExts []string) (*Verifier, error) {
+	return NewVerifierWithSourceAddress(caKeys, maxLifetime, allowedExts, "")
+}
+
+// NewVerifierWithSourceAddress builds a Verifier that optionally requires an
+// exact SSH critical option "source-address" (e.g. "127.0.0.1/32,::1/128") to
+// prevent short-lived certificates from being used directly over the network.
+func NewVerifierWithSourceAddress(caKeys []string, maxLifetime time.Duration, allowedExts []string, requiredSourceAddr string) (*Verifier, error) {
 	if len(caKeys) == 0 {
 		return nil, errors.New("ca: user_ca_public_keys required to verify issued certificates")
 	}
-	v := &Verifier{maxLifetime: maxLifetime, allowedExts: allowedExts}
+	v := &Verifier{maxLifetime: maxLifetime, allowedExts: allowedExts, requiredSourceAddr: strings.TrimSpace(requiredSourceAddr)}
 	if v.maxLifetime <= 0 {
 		v.maxLifetime = 5 * time.Minute
 	}
@@ -345,8 +354,16 @@ func (v *Verifier) Verify(cert *ssh.Certificate, r Request, now time.Time) error
 	if cert.KeyId != r.KeyID {
 		return fail("key id mismatch")
 	}
-	if len(cert.CriticalOptions) != 0 {
-		return fail("unexpected critical options")
+	var supportedCritical []string
+	if v.requiredSourceAddr == "" {
+		if len(cert.CriticalOptions) != 0 {
+			return fail("unexpected critical options")
+		}
+	} else {
+		if len(cert.CriticalOptions) != 1 || cert.CriticalOptions["source-address"] != v.requiredSourceAddr {
+			return fail("source-address critical option mismatch")
+		}
+		supportedCritical = []string{"source-address"}
 	}
 	for ext := range cert.Extensions {
 		if !slices.Contains(v.allowedExts, ext) {
@@ -363,7 +380,10 @@ func (v *Verifier) Verify(cert *ssh.Certificate, r Request, now time.Time) error
 	if cert.ValidAfter > unix+5 {
 		return fail("not yet valid")
 	}
-	checker := &ssh.CertChecker{Clock: func() time.Time { return now }}
+	checker := &ssh.CertChecker{
+		Clock:                    func() time.Time { return now },
+		SupportedCriticalOptions: supportedCritical,
+	}
 	if err := checker.CheckCert(r.Principal, cert); err != nil {
 		return fail(err.Error())
 	}

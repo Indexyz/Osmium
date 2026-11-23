@@ -44,6 +44,7 @@ type Server struct {
 func (s *Server) WebHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /", web.Handler())
+	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /auth/login", s.Auth.HandleLogin)
 	mux.HandleFunc("GET /auth/callback", s.Auth.HandleCallback)
 	mux.HandleFunc("GET /auth/dev-login", s.Auth.HandleDevLogin)
@@ -52,7 +53,7 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("POST /auth/cli", s.sameOrigin(s.Auth.HandleCLIApprove))
 	mux.HandleFunc("POST /auth/cli/token", s.Auth.HandleCLIToken)
 	mux.HandleFunc("POST /api/v1/cli/logout", s.authed(s.cliLogout))
-	mux.HandleFunc("POST /api/v1/native-sessions", s.authed(s.csrf(s.createNative)))
+	mux.HandleFunc("POST /api/v1/native-sessions", s.authed(s.createNative))
 	mux.HandleFunc("GET /api/v1/ssh-sessions/{session_id}/tunnel", s.authed(s.nativeTunnel))
 	mux.HandleFunc("GET /api/v1/me", s.authed(s.me))
 	mux.HandleFunc("GET /api/v1/hosts", s.authed(s.listHosts))
@@ -63,7 +64,14 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/ssh-sessions/{session_id}/terminal", s.authed(s.terminal))
 	mux.HandleFunc("GET /api/v1/admin/agents", s.authed(s.adminAgents))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.authed(s.adminAudit))
+	mux.HandleFunc("GET /api/v1/admin/cli-tokens", s.authed(s.adminListCLITokens))
+	mux.HandleFunc("POST /api/v1/admin/cli-tokens/{token_id}/revoke", s.authed(s.csrf(s.adminRevokeCLIToken)))
+	mux.HandleFunc("POST /api/v1/admin/users/{user_id}/revoke", s.authed(s.csrf(s.adminRevokeUser)))
 	return securityHeaders(mux)
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // AgentHandler returns the handler for the mTLS Agent listener.
@@ -137,7 +145,13 @@ func (s *Server) authed(h func(http.ResponseWriter, *http.Request, *reqCtx)) htt
 			}
 			rc.web, rc.user = ws, ws.User
 		}
-		rc.subject = authn.Subject(rc.user, s.Store.Current())
+		snap := s.Store.Current()
+		rc.subject = authn.Subject(rc.user, snap)
+		if snap.IsDisabled(rc.subject) {
+			s.Audit.Record(audit.Event{Actor: "user:" + rc.subject.UserID, User: rc.subject.Name, Action: "auth.access", Result: "denied", Revision: snap.Revision, Reason: "user_disabled"})
+			writeError(w, r, http.StatusForbidden, "USER_DISABLED", "user is disabled")
+			return
+		}
 		h(w, r, rc)
 	}
 }
@@ -334,6 +348,58 @@ func (s *Server) adminAgents(w http.ResponseWriter, r *http.Request, rc *reqCtx)
 	writeJSON(w, http.StatusOK, map[string]any{"items": s.Hub.Agents()})
 }
 
+func (s *Server) adminListCLITokens(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.Auth.ListCLITokens()})
+}
+
+func (s *Server) adminRevokeCLIToken(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	id := r.PathValue("token_id")
+	if !authz.ValidID(id) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid token id")
+		return
+	}
+	info, ok := s.Auth.RevokeCLITokenByID(id)
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "not found")
+		return
+	}
+	s.Audit.Record(audit.Event{Actor: "user:" + rc.subject.UserID, User: rc.subject.Name, Action: "admin.cli_token_revoke", Result: "ok", Target: "user:" + info.UserID, Extra: map[string]any{"token_id": info.ID}})
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": info})
+}
+
+func (s *Server) adminRevokeUser(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	userID := r.PathValue("user_id")
+	if !authz.ValidID(userID) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid user id")
+		return
+	}
+	webN, cliN := s.Auth.RevokeUser(userID)
+	sessN := s.Sessions.CloseUserSessions(userID, "user:"+rc.subject.UserID, "admin_user_revoke")
+	s.Audit.Record(audit.Event{
+		Actor: "user:" + rc.subject.UserID, User: rc.subject.Name,
+		Action: "admin.user_revoke", Result: "ok", Target: "user:" + userID,
+		Extra: map[string]any{"revoked_web_sessions": webN, "revoked_cli_tokens": cliN, "closed_sessions": sessN},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user_id":              userID,
+		"revoked_web_sessions": webN,
+		"revoked_cli_tokens":   cliN,
+		"closed_sessions":      sessN,
+	})
+}
+
 // adminAudit searches the persistent audit log (admins only). Query:
 // from, to (RFC 3339; default the last 24h), user (display name or user ID),
 // action, actor, session_id, target, limit (1..1000, default 100), cursor (from next_cursor).
@@ -472,9 +538,11 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 	case err := <-done:
 		if err != nil {
 			ws.Close(websocket.StatusPolicyViolation, "cannot attach")
-			return
+		} else {
+			ws.Close(websocket.StatusNormalClosure, "session ended")
 		}
-		ws.Close(websocket.StatusNormalClosure, "session ended")
+		cancel()
+		<-readErr
 	case err := <-readErr:
 		if errors.Is(err, errProtocol) {
 			_, _ = s.Sessions.Close(rc.subject, id, "terminal_protocol_error")
@@ -482,7 +550,9 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 			ws.Close(websocket.StatusPolicyViolation, "invalid terminal message")
 			return
 		}
-		// Browser went away: the session ends (pending product decision O06).
+		// Browser went away: cancel pending writes first so shutdown does not
+		// block on write timeouts against a dead socket (pending decision O06).
+		cancel()
 		_, _ = s.Sessions.Close(rc.subject, id, "browser_disconnected")
 		<-done
 	}

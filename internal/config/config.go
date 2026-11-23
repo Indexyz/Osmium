@@ -87,9 +87,10 @@ type CA struct {
 	SignPath            string   `json:"sign_path"`
 	ValidBefore         string   `json:"valid_before"`
 	Timeout             Duration `json:"timeout"`
-	UserCAPublicKeyFile string   `json:"user_ca_public_key_file"`
-	MaxCertLifetime     Duration `json:"max_cert_lifetime"`
-	AllowedExtensions   []string `json:"allowed_extensions"`
+	UserCAPublicKeyFile   string   `json:"user_ca_public_key_file"`
+	MaxCertLifetime       Duration `json:"max_cert_lifetime"`
+	AllowedExtensions     []string `json:"allowed_extensions"`
+	RequiredSourceAddress string   `json:"required_source_address"`
 }
 
 // Sessions holds session policy knobs.
@@ -97,8 +98,10 @@ type Sessions struct {
 	AttachTimeout      Duration `json:"attach_timeout"`
 	SSHHandshake       Duration `json:"ssh_handshake"`
 	MaxSessionDuration Duration `json:"max_session_duration"`
+	IdleTimeout        Duration `json:"idle_timeout"`
 	MaxPerUser         int      `json:"max_per_user"`
 	MaxTotal           int      `json:"max_total"`
+	MaxConcurrentSigns int      `json:"max_concurrent_signs"`
 	RevokeActive       *bool    `json:"revoke_active"`
 }
 
@@ -147,10 +150,11 @@ type Server struct {
 	Sessions Sessions `json:"sessions"`
 	Smux     Smux     `json:"smux"`
 
-	TicketTTL        Duration `json:"tunnel_ticket_ttl"`
-	HeartbeatTimeout Duration `json:"heartbeat_timeout"`
-	StreamOpen       Duration `json:"stream_open_timeout"`
-	MaxStreams       int      `json:"max_streams_per_agent"`
+	TicketTTL         Duration `json:"tunnel_ticket_ttl"`
+	HeartbeatTimeout  Duration `json:"heartbeat_timeout"`
+	StreamOpen        Duration `json:"stream_open_timeout"`
+	MaxStreams        int      `json:"max_streams_per_agent"`
+	MaxPendingStreams int      `json:"max_pending_streams_per_agent"`
 }
 
 // Agent is the agent configuration.

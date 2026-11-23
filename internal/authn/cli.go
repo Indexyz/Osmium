@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,8 +41,23 @@ type cliCode struct {
 
 // CLIToken is a CLI Bearer credential.
 type CLIToken struct {
-	User      User
-	ExpiresAt time.Time
+	ID         string
+	User       User
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	LastUsedAt time.Time
+}
+
+// CLITokenInfo is the admin-visible metadata of an active CLI token. Neither
+// the raw token nor its hash is ever exposed.
+type CLITokenInfo struct {
+	ID          string    `json:"id"`
+	UserID      string    `json:"user_id"`
+	DisplayName string    `json:"display_name,omitempty"`
+	Issuer      string    `json:"issuer,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	LastUsedAt  time.Time `json:"last_used_at,omitzero"`
 }
 
 // SafeNext returns p if it is a same-origin absolute path, else "/".
@@ -205,17 +221,29 @@ func (a *Authenticator) HandleCLIToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := cliTokenPfx + random(32)
-	t := &CLIToken{User: c.user, ExpiresAt: time.Now().Add(a.cfg.SessionTTL)}
+	now := time.Now().UTC()
+	t := &CLIToken{ID: "ct-" + random(9), User: c.user, CreatedAt: now, ExpiresAt: now.Add(a.cfg.SessionTTL)}
 	a.mu.Lock()
-	now := time.Now()
 	for k, v := range a.cliTokens {
 		if now.After(v.ExpiresAt) {
 			delete(a.cliTokens, k)
 		}
 	}
+	if len(a.cliTokens) >= maxCLITokens {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range a.cliTokens {
+			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
+				oldestKey, oldestTime = k, v.CreatedAt
+			}
+		}
+		if oldestKey != "" {
+			delete(a.cliTokens, oldestKey)
+		}
+	}
 	a.cliTokens[key(tok)] = t
 	a.mu.Unlock()
-	a.audit.Record(audit.Event{Actor: "user:" + c.user.ID, User: c.user.DisplayName, Action: "cli.token", Result: "ok"})
+	a.audit.Record(audit.Event{Actor: "user:" + c.user.ID, User: c.user.DisplayName, Action: "cli.token", Result: "ok", Extra: map[string]any{"token_id": t.ID}})
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]any{"access_token": tok, "token_type": "Bearer", "expires_at": t.ExpiresAt, "user": c.user})
@@ -251,11 +279,14 @@ func (a *Authenticator) LookupBearer(r *http.Request) (*CLIToken, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	c, ok := a.cliTokens[key(t)]
-	if !ok || time.Now().After(c.ExpiresAt) {
+	now := time.Now().UTC()
+	if !ok || now.After(c.ExpiresAt) {
 		delete(a.cliTokens, key(t))
 		return nil, false
 	}
-	return c, true
+	c.LastUsedAt = now
+	cp := *c
+	return &cp, true
 }
 
 // RevokeBearer deletes the request's CLI token.
@@ -265,4 +296,47 @@ func (a *Authenticator) RevokeBearer(r *http.Request) {
 		delete(a.cliTokens, key(t))
 		a.mu.Unlock()
 	}
+}
+
+func tokenInfo(c *CLIToken) CLITokenInfo {
+	return CLITokenInfo{
+		ID:          c.ID,
+		UserID:      c.User.ID,
+		DisplayName: c.User.DisplayName,
+		Issuer:      c.User.Issuer,
+		CreatedAt:   c.CreatedAt,
+		ExpiresAt:   c.ExpiresAt,
+		LastUsedAt:  c.LastUsedAt,
+	}
+}
+
+// ListCLITokens returns metadata for all non-expired CLI tokens, newest first.
+func (a *Authenticator) ListCLITokens() []CLITokenInfo {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	out := make([]CLITokenInfo, 0, len(a.cliTokens))
+	for k, c := range a.cliTokens {
+		if now.After(c.ExpiresAt) {
+			delete(a.cliTokens, k)
+			continue
+		}
+		out = append(out, tokenInfo(c))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+// RevokeCLITokenByID removes one CLI token by its non-secret metadata ID.
+func (a *Authenticator) RevokeCLITokenByID(id string) (CLITokenInfo, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for k, c := range a.cliTokens {
+		if c.ID == id {
+			info := tokenInfo(c)
+			delete(a.cliTokens, k)
+			return info, true
+		}
+	}
+	return CLITokenInfo{}, false
 }

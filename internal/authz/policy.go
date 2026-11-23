@@ -134,10 +134,11 @@ type Grant struct {
 
 // Document is the on-disk policy file.
 type Document struct {
-	Scope  string            `json:"scope"`
-	Admins []SubjectSelector `json:"admins"`
-	Hosts  []*Host           `json:"hosts"`
-	Grants []Grant           `json:"grants"`
+	Scope         string            `json:"scope"`
+	Admins        []SubjectSelector `json:"admins"`
+	DisabledUsers []SubjectSelector `json:"disabled_users,omitempty"`
+	Hosts         []*Host           `json:"hosts"`
+	Grants        []Grant           `json:"grants"`
 }
 
 // Snapshot is an immutable, validated policy revision.
@@ -145,6 +146,7 @@ type Snapshot struct {
 	Revision uint64
 	Scope    string
 	admins   []SubjectSelector
+	disabled []SubjectSelector
 	hosts    map[string]*Host
 	byCN     map[string]*Host
 	grants   []Grant
@@ -164,10 +166,15 @@ func Parse(r io.Reader) (*Snapshot, error) {
 	if !idRe.MatchString(doc.Scope) || bytes.ContainsAny([]byte(doc.Scope), ":") {
 		return nil, errors.New("policy: invalid scope")
 	}
-	s := &Snapshot{Scope: doc.Scope, admins: doc.Admins, hosts: map[string]*Host{}, byCN: map[string]*Host{}, grants: doc.Grants}
+	s := &Snapshot{Scope: doc.Scope, admins: doc.Admins, disabled: doc.DisabledUsers, hosts: map[string]*Host{}, byCN: map[string]*Host{}, grants: doc.Grants}
 	for i, a := range doc.Admins {
 		if err := a.validate(); err != nil {
 			return nil, fmt.Errorf("policy: admins[%d]: %w", i, err)
+		}
+	}
+	for i, d := range doc.DisabledUsers {
+		if err := d.validate(); err != nil {
+			return nil, fmt.Errorf("policy: disabled_users[%d]: %w", i, err)
 		}
 	}
 	agentIDs := map[string]bool{}
@@ -241,8 +248,22 @@ func Parse(r io.Reader) (*Snapshot, error) {
 	return s, nil
 }
 
-// IsAdmin reports whether u is an administrator.
+// IsDisabled reports whether u is explicitly disabled by policy.
+func (s *Snapshot) IsDisabled(u Subject) bool {
+	for _, d := range s.disabled {
+		if d.matches(u) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAdmin reports whether u is an active administrator. Disabled users are
+// never treated as administrators even if matched by admins.
 func (s *Snapshot) IsAdmin(u Subject) bool {
+	if s.IsDisabled(u) {
+		return false
+	}
 	for _, a := range s.admins {
 		if a.matches(u) {
 			return true
@@ -265,7 +286,7 @@ func (s *Snapshot) HostByAgentCN(cn string) (*Host, bool) {
 
 // AllowedLogins returns the logins u may use on h, sorted.
 func (s *Snapshot) AllowedLogins(u Subject, h *Host) []string {
-	if h.Disabled {
+	if h.Disabled || s.IsDisabled(u) {
 		return nil
 	}
 	set := map[string]bool{}
@@ -298,6 +319,10 @@ type Decision struct {
 // Check decides whether u may open login on hostID.
 func (s *Snapshot) Check(u Subject, hostID, login string) Decision {
 	d := Decision{Revision: s.Revision}
+	if s.IsDisabled(u) {
+		d.Reason = "user_disabled"
+		return d
+	}
 	h, ok := s.hosts[hostID]
 	switch {
 	case !ok:

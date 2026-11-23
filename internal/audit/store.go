@@ -137,10 +137,19 @@ func (s *s3Store) List(ctx context.Context, dir string) ([]string, error) {
 }
 
 func (s *s3Store) Delete(ctx context.Context, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	objs := make(chan minio.ObjectInfo, len(names))
 	for _, n := range names {
-		if err := s.c.RemoveObject(ctx, s.bucket, s.prefix+n, minio.RemoveObjectOptions{}); err != nil {
-			return err
+		objs <- minio.ObjectInfo{Key: s.prefix + n}
+	}
+	close(objs)
+	var errs []error
+	for r := range s.c.RemoveObjects(ctx, s.bucket, objs, minio.RemoveObjectsOptions{}) {
+		if r.Err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.ObjectName, r.Err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

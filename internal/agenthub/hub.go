@@ -36,13 +36,14 @@ var (
 
 // Config tunes the hub.
 type Config struct {
-	ServerID         string
-	Mux              tunnel.MuxConfig
-	TicketTTL        time.Duration
-	HelloTimeout     time.Duration
-	HeartbeatTimeout time.Duration
-	StreamOpen       time.Duration
-	MaxStreams       int // per Agent epoch, pending + active
+	ServerID          string
+	Mux               tunnel.MuxConfig
+	TicketTTL         time.Duration
+	HelloTimeout      time.Duration
+	HeartbeatTimeout  time.Duration
+	StreamOpen        time.Duration
+	MaxStreams        int // per Agent epoch, pending + active
+	MaxPendingStreams int // per Agent epoch, unauthenticated streams (protects sshd MaxStartups)
 }
 
 func (c *Config) defaults() {
@@ -66,6 +67,12 @@ func (c *Config) defaults() {
 	}
 	if c.MaxStreams <= 0 {
 		c.MaxStreams = 32
+	}
+	if c.MaxPendingStreams <= 0 {
+		c.MaxPendingStreams = min(8, c.MaxStreams)
+	}
+	if c.MaxPendingStreams > c.MaxStreams {
+		c.MaxPendingStreams = c.MaxStreams
 	}
 }
 
@@ -99,6 +106,7 @@ type presence struct {
 	writeMu             sync.Mutex
 	mux                 *smux.Session
 	sem                 chan struct{}
+	pendingSem          chan struct{}
 	agentVersion        string
 	reportedLabels      map[string]string
 	connectedAt         time.Time
@@ -107,7 +115,10 @@ type presence struct {
 // New creates a hub and subscribes it to policy changes.
 func New(cfg Config, store *authz.Store, a *audit.Logger, log *slog.Logger) *Hub {
 	cfg.defaults()
-	h := &Hub{cfg: cfg, store: store, audit: a, log: log, byAgent: map[string]*presence{}, tickets: map[string]*ticket{}}
+	// Seed epoch from millisecond wall clock so single-replica restarts do not
+	// reset epochs back to 1 and collide in audit trails.
+	seed := uint64(time.Now().UnixMilli())
+	h := &Hub{cfg: cfg, store: store, audit: a, log: log, epoch: seed, byAgent: map[string]*presence{}, tickets: map[string]*ticket{}}
 	store.OnChange(h.reconcilePolicy)
 	return h
 }
@@ -237,8 +248,8 @@ func (h *Hub) HandleControl(w http.ResponseWriter, r *http.Request) {
 	p := &presence{
 		agentID: host.Agent.ID, hostID: host.ID, cn: cn,
 		tunnelID: "dt-" + randomToken(9), ctx: ctx, cancel: cancel, control: ws,
-		sem: make(chan struct{}, h.cfg.MaxStreams), agentVersion: hello.AgentVersion,
-		reportedLabels: hello.ReportedLabels, connectedAt: time.Now(),
+		sem: make(chan struct{}, h.cfg.MaxStreams), pendingSem: make(chan struct{}, h.cfg.MaxPendingStreams),
+		agentVersion: hello.AgentVersion, reportedLabels: hello.ReportedLabels, connectedAt: time.Now(),
 	}
 	tk := randomToken(32)
 	h.mu.Lock()
@@ -250,6 +261,8 @@ func (h *Hub) HandleControl(w http.ResponseWriter, r *http.Request) {
 	h.gcTicketsLocked()
 	h.mu.Unlock()
 	if old != nil {
+		h.log.Warn("agent registration superseded existing epoch (possible duplicate credential or fast reconnect)", "agent_id", p.agentID, "host_id", p.hostID, "old_epoch", old.epoch, "new_epoch", p.epoch)
+		h.audit.Record(audit.Event{Actor: "agent:" + p.agentID, Action: "agent.superseded", Result: "ok", Target: p.hostID, Extra: map[string]any{"old_epoch": old.epoch, "new_epoch": p.epoch}})
 		old.cancel() // a newer registration supersedes the old epoch
 	}
 	h.audit.Record(audit.Event{Actor: "agent:" + p.agentID, Action: "agent.register", Result: "ok", Target: p.hostID, Extra: map[string]any{"epoch": p.epoch, "agent_version": p.agentVersion}})
@@ -277,6 +290,19 @@ func (h *Hub) HandleControl(w http.ResponseWriter, r *http.Request) {
 	if err := p.send(ctx, protocol.TypeWelcome, welcome); err != nil {
 		return
 	}
+	// Do not let a control-only epoch stay stuck in "connecting" forever after
+	// the data tunnel ticket expires.
+	dataWatchdog := time.AfterFunc(h.cfg.TicketTTL+5*time.Second, func() {
+		h.mu.Lock()
+		ready := p.mux != nil
+		h.mu.Unlock()
+		if !ready && p.ctx.Err() == nil {
+			h.log.Warn("closing agent epoch: data tunnel not established before ticket expiry", "agent_id", p.agentID, "epoch", p.epoch)
+			h.audit.Record(audit.Event{Actor: "agent:" + p.agentID, Action: "agent.data_timeout", Result: "error", Target: p.hostID, Extra: map[string]any{"epoch": p.epoch}})
+			p.cancel()
+		}
+	})
+	defer dataWatchdog.Stop()
 	h.notify(p.hostID)
 	for {
 		rctx, rcancel := context.WithTimeout(ctx, h.cfg.HeartbeatTimeout)
@@ -405,15 +431,30 @@ type Stream struct {
 	Epoch                     uint64
 	StreamID                  uint32
 	release                   func()
+	releasePending            func()
 }
 
 // CloseWrite half-closes the stream.
 func (s *Stream) CloseWrite() error { return s.Conn.(*smux.Stream).CloseWrite() }
 
+// MarkAuthenticated releases this stream's unauthenticated-pending quota slot
+// once SSH authentication has completed (or native handoff is active). Safe to
+// call multiple times.
+func (s *Stream) MarkAuthenticated() {
+	if s.releasePending != nil {
+		s.releasePending()
+	}
+}
+
 // Close closes this stream only; the shared tunnel stays up.
 func (s *Stream) Close() error {
 	err := s.Conn.Close()
-	s.release()
+	if s.releasePending != nil {
+		s.releasePending()
+	}
+	if s.release != nil {
+		s.release()
+	}
 	return err
 }
 
@@ -435,18 +476,27 @@ func (h *Hub) OpenStream(ctx context.Context, hostID, sessionID, attemptID strin
 		return nil, ErrNotReady
 	}
 	select {
+	case p.pendingSem <- struct{}{}:
+	default:
+		return nil, ErrBusy
+	}
+	var pendingOnce sync.Once
+	releasePending := func() { pendingOnce.Do(func() { <-p.pendingSem }) }
+	select {
 	case p.sem <- struct{}{}:
 	default:
+		releasePending()
 		return nil, ErrBusy
 	}
 	var once sync.Once
 	release := func() { once.Do(func() { <-p.sem }) }
 	st, err := tunnel.OpenSSHStream(ctx, mux, tunnel.OpenRequest{Version: 1, Type: "ssh.open", HostID: hostID, SessionID: sessionID, AttemptID: attemptID, Epoch: p.epoch}, h.cfg.StreamOpen)
 	if err != nil {
+		releasePending()
 		release()
 		return nil, err
 	}
-	return &Stream{Conn: st, HostID: hostID, AgentID: p.agentID, TunnelID: p.tunnelID, Epoch: p.epoch, StreamID: st.ID(), release: release}, nil
+	return &Stream{Conn: st, HostID: hostID, AgentID: p.agentID, TunnelID: p.tunnelID, Epoch: p.epoch, StreamID: st.ID(), release: release, releasePending: releasePending}, nil
 }
 
 // CloseAttempt asks the Agent to drop the attempt's stream/TCP. It only acts
@@ -476,6 +526,7 @@ type AgentInfo struct {
 	ReportedLabels map[string]string `json:"reported_labels"`
 	ConnectedAt    time.Time         `json:"connected_at"`
 	Streams        int               `json:"streams"`
+	PendingStreams int               `json:"pending_streams"`
 }
 
 // Agents lists connected agents.
@@ -484,7 +535,7 @@ func (h *Hub) Agents() []AgentInfo {
 	defer h.mu.Unlock()
 	out := make([]AgentInfo, 0, len(h.byAgent))
 	for _, p := range h.byAgent {
-		out = append(out, AgentInfo{AgentID: p.agentID, HostID: p.hostID, Epoch: p.epoch, DataReady: p.mux != nil && !p.mux.IsClosed(), AgentVersion: p.agentVersion, ReportedLabels: p.reportedLabels, ConnectedAt: p.connectedAt, Streams: len(p.sem)})
+		out = append(out, AgentInfo{AgentID: p.agentID, HostID: p.hostID, Epoch: p.epoch, DataReady: p.mux != nil && !p.mux.IsClosed(), AgentVersion: p.agentVersion, ReportedLabels: p.reportedLabels, ConnectedAt: p.connectedAt, Streams: len(p.sem), PendingStreams: len(p.pendingSem)})
 	}
 	return out
 }

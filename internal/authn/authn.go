@@ -26,8 +26,10 @@ import (
 )
 
 const (
-	cookieName  = "web_session"
-	stateCookie = "oidc_state"
+	cookieName     = "web_session"
+	stateCookie    = "oidc_state"
+	maxWebSessions = 10000
+	maxCLITokens   = 10000
 )
 
 // User is the internal user identity.
@@ -50,6 +52,7 @@ func UserID(issuer, subject string) string {
 type WebSession struct {
 	User      User
 	CSRF      string
+	CreatedAt time.Time
 	ExpiresAt time.Time
 }
 
@@ -160,18 +163,64 @@ func Subject(u User, snap *authz.Snapshot) authz.Subject {
 
 func (a *Authenticator) startSession(w http.ResponseWriter, u User) {
 	tok := random(32)
-	s := &WebSession{User: u, CSRF: random(24), ExpiresAt: time.Now().Add(a.cfg.SessionTTL)}
-	a.mu.Lock()
 	now := time.Now()
+	s := &WebSession{User: u, CSRF: random(24), CreatedAt: now, ExpiresAt: now.Add(a.cfg.SessionTTL)}
+	a.mu.Lock()
 	for k, v := range a.sessions {
 		if now.After(v.ExpiresAt) {
 			delete(a.sessions, k)
+		}
+	}
+	if len(a.sessions) >= maxWebSessions {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range a.sessions {
+			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
+				oldestKey, oldestTime = k, v.CreatedAt
+			}
+		}
+		if oldestKey != "" {
+			delete(a.sessions, oldestKey)
 		}
 	}
 	a.sessions[key(tok)] = s
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: tok, Path: "/", HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode, Expires: s.ExpiresAt})
 	a.audit.Record(audit.Event{Actor: "user:" + u.ID, User: u.DisplayName, Action: "web.login", Result: "ok", Extra: map[string]any{"issuer": u.Issuer}})
+}
+
+// RevokeUser deletes every Web session and CLI token belonging to userID and
+// returns how many of each were removed.
+func (a *Authenticator) RevokeUser(userID string) (webCount, cliCount int) {
+	return a.RevokeMatching(func(u authz.Subject) bool { return u.UserID == userID })
+}
+
+// RevokeMatching deletes every Web session and CLI token whose user satisfies
+// match, as well as any pending CLI authorization codes for those users.
+func (a *Authenticator) RevokeMatching(match func(authz.Subject) bool) (webCount, cliCount int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	subj := func(u User) authz.Subject {
+		return authz.Subject{UserID: u.ID, Issuer: u.Issuer, Sub: u.Subject, Groups: u.Groups, Name: u.DisplayName}
+	}
+	for k, s := range a.sessions {
+		if match(subj(s.User)) {
+			delete(a.sessions, k)
+			webCount++
+		}
+	}
+	for k, c := range a.cliTokens {
+		if match(subj(c.User)) {
+			delete(a.cliTokens, k)
+			cliCount++
+		}
+	}
+	for k, c := range a.cliCodes {
+		if match(subj(c.user)) {
+			delete(a.cliCodes, k)
+		}
+	}
+	return webCount, cliCount
 }
 
 // HandleLogin starts the OIDC flow.

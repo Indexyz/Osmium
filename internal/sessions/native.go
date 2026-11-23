@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -29,9 +30,15 @@ const (
 // already used for another attempt.
 var ErrKeyReused = errors.New("public key already used")
 
-// keyReuseWindow is how long native client key fingerprints are remembered.
-// It is far longer than any certificate lifetime.
-const keyReuseWindow = 24 * time.Hour
+const (
+	// keyReuseWindow is how long native client key fingerprints are remembered.
+	// It is far longer than any certificate lifetime.
+	keyReuseWindow = 24 * time.Hour
+
+	// nativeDrainTimeout bounds how long we wait for sshd's tail bytes after
+	// the native client cleanly half-closes its write side.
+	nativeDrainTimeout = 5 * time.Second
+)
 
 // NativeRequest is the only accepted input for a native session. The CLI
 // supplies its ephemeral public key; principal, TTL and CA options are
@@ -88,8 +95,11 @@ func (m *Manager) CreateNative(u authz.Subject, r NativeRequest) (*Session, erro
 type NativeClient interface {
 	State(state string)
 	// Ready hands the certificate and pinned host keys to the CLI; after it
-	// returns, Read/Write carry raw SSH bytes.
+	// returns, Read/Write carry raw SSH bytes only.
 	Ready(cert *ssh.Certificate, hostKeys []ssh.PublicKey) error
+	// CloseRead unblocks any pending Read without closing the write path so
+	// the caller can still deliver native.exit cleanly.
+	CloseRead()
 	io.ReadWriter
 }
 
@@ -127,7 +137,7 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 	if !s.transition(StateWaitingAgent, StateCreated) {
 		return "cancelled"
 	}
-	if !m.recheck(s, "open") {
+	if _, _, ok := m.recheck(s, "open"); !ok {
 		return "permission_denied"
 	}
 	attemptID := newID("a-")
@@ -147,16 +157,12 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 	if !s.transition(StateSigning, StateWaitingAgent) {
 		return "cancelled"
 	}
-	if !m.recheck(s, "sign") {
-		return "permission_denied"
-	}
-	snap := m.store.Current()
-	host, ok := snap.Host(s.HostID)
+	snap, host, ok := m.recheck(s, "sign")
 	if !ok {
 		return "permission_denied"
 	}
 	req := ca.Request{PublicKey: s.clientKey, KeyID: "user:" + s.Subject.UserID + "/session:" + s.ID, Principal: authz.Principal(snap.Scope, s.HostID, s.Login)}
-	cert, err := m.signer.SignUserCert(ctx, req)
+	cert, err := m.signCert(ctx, req)
 	if err != nil {
 		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ca.sign", Result: "error", SessionID: s.ID, AttemptID: attemptID})
 		return m.failure(s, "ca_sign", err)
@@ -172,34 +178,106 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 		Extra: map[string]any{"mode": ModeNative, "serial": fmt.Sprint(cert.Serial), "key_id": cert.KeyId, "valid_after": att.ValidAfter, "valid_before": att.ValidBefore, "fingerprint": att.PublicKeyFingerprint, "epoch": att.Epoch, "stream_id": att.StreamID}})
 
 	// The Server cannot observe SSH authentication in this mode; the last
-	// gate is before any byte of the user's SSH connection reaches sshd.
+	// gate is before handing the certificate or forwarding bytes to sshd.
 	if ctx.Err() != nil {
 		return m.failure(s, "activate", ctx.Err())
 	}
-	if !m.recheck(s, "activate") {
+	if _, _, ok := m.recheck(s, "activate"); !ok {
 		return "permission_denied"
-	}
-	if !s.transition(StateActive, StateSigning) {
-		return "cancelled"
 	}
 	if err := c.Ready(cert, host.HostKeys()); err != nil {
 		return "client_disconnected"
 	}
+	if !s.transition(StateActive, StateSigning) {
+		return "cancelled"
+	}
+	stopIdle := s.startIdle(m.cfg.IdleTimeout)
+	defer stopIdle()
 	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session.active", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, AttemptID: attemptID, Extra: map[string]any{"mode": ModeNative}})
 
-	type result struct{ client bool }
-	done := make(chan result, 2)
+	type copyResult struct {
+		client bool
+		err    error
+	}
+	done := make(chan copyResult, 2)
+	var authOnce sync.Once
 	go func() {
-		_, _ = io.CopyBuffer(stream, c, make([]byte, 32*1024))
-		done <- result{client: true}
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := c.Read(buf)
+			if n > 0 {
+				s.touchIdle()
+				authOnce.Do(stream.MarkAuthenticated)
+				if _, werr := stream.Write(buf[:n]); werr != nil {
+					done <- copyResult{client: true, err: werr}
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					// Propagate clean EOF via half-close so sshd's tail output can drain.
+					_ = stream.CloseWrite()
+					done <- copyResult{client: true, err: nil}
+					return
+				}
+				done <- copyResult{client: true, err: err}
+				return
+			}
+		}
 	}()
 	go func() {
-		_, _ = io.CopyBuffer(c, stream, make([]byte, 32*1024))
-		done <- result{client: false}
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := stream.Read(buf)
+			if n > 0 {
+				s.touchIdle()
+				if _, werr := c.Write(buf[:n]); werr != nil {
+					done <- copyResult{client: false, err: werr}
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					done <- copyResult{client: false, err: nil}
+					return
+				}
+				done <- copyResult{client: false, err: err}
+				return
+			}
+		}
 	}()
-	first := <-done
-	// Unblock the stream side; the caller closes the client side.
-	_ = stream.Close()
+
+	var first copyResult
+	select {
+	case first = <-done:
+	case <-ctx.Done():
+		_ = stream.Close()
+		c.CloseRead()
+		<-done
+		<-done
+		return context.Cause(ctx).Error()
+	}
+
+	if first.client && first.err == nil {
+		drain := time.NewTimer(nativeDrainTimeout)
+		defer drain.Stop()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			_ = stream.Close()
+			c.CloseRead()
+			<-done
+		case <-drain.C:
+			_ = stream.Close()
+			c.CloseRead()
+			<-done
+		}
+	} else {
+		_ = stream.Close()
+		c.CloseRead()
+		<-done
+	}
+
 	if cause := context.Cause(ctx); cause != nil {
 		return cause.Error()
 	}

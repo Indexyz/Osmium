@@ -63,11 +63,18 @@ type Config struct {
 	AttachTimeout      time.Duration // created → must attach within
 	SSHHandshake       time.Duration
 	MaxSessionDuration time.Duration // 0 = unlimited
+	IdleTimeout        time.Duration // 0 = disabled
 	MaxPerUser         int
 	MaxTotal           int
+	MaxConcurrentSigns int  // bounds concurrent CA sign requests
 	RevokeActive       bool // close active sessions when access is revoked
 	Retention          time.Duration
 }
+
+const (
+	maxIdemEntries = 50000
+	maxSeenKeys    = 100000
+)
 
 func (c *Config) defaults() {
 	if c.AttachTimeout <= 0 {
@@ -81,6 +88,9 @@ func (c *Config) defaults() {
 	}
 	if c.MaxTotal <= 0 {
 		c.MaxTotal = 1000
+	}
+	if c.MaxConcurrentSigns <= 0 {
+		c.MaxConcurrentSigns = 16
 	}
 	if c.Retention <= 0 {
 		c.Retention = time.Hour
@@ -126,8 +136,39 @@ type Session struct {
 	cancel         context.CancelCauseFunc
 	sshSession     *ssh.Session
 	stdin          io.WriteCloser
+	idleMu         sync.Mutex
+	idleTimer      *time.Timer
+	idleTimeout    time.Duration
 	listeners      []func(state string)
 	done           chan struct{}
+}
+
+func (s *Session) startIdle(d time.Duration) func() {
+	if d <= 0 {
+		return func() {}
+	}
+	s.idleMu.Lock()
+	s.idleTimeout = d
+	s.idleTimer = time.AfterFunc(d, func() {
+		s.cancel(errors.New("idle_timeout"))
+	})
+	s.idleMu.Unlock()
+	return func() {
+		s.idleMu.Lock()
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+			s.idleTimer = nil
+		}
+		s.idleMu.Unlock()
+	}
+}
+
+func (s *Session) touchIdle() {
+	s.idleMu.Lock()
+	if s.idleTimer != nil && s.idleTimeout > 0 {
+		s.idleTimer.Reset(s.idleTimeout)
+	}
+	s.idleMu.Unlock()
 }
 
 // View is the public projection of a session.
@@ -229,12 +270,13 @@ func (s *Session) finish(state, reason string) bool {
 
 // Manager tracks sessions.
 type Manager struct {
-	cfg    Config
-	store  *authz.Store
-	hub    Opener
-	signer ca.Signer
-	audit  *audit.Logger
-	log    *slog.Logger
+	cfg     Config
+	store   *authz.Store
+	hub     Opener
+	signer  ca.Signer
+	signSem chan struct{}
+	audit   *audit.Logger
+	log     *slog.Logger
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -251,9 +293,19 @@ type idemEntry struct {
 // NewManager creates a Manager and subscribes it to policy changes.
 func NewManager(cfg Config, store *authz.Store, hub Opener, signer ca.Signer, a *audit.Logger, log *slog.Logger) *Manager {
 	cfg.defaults()
-	m := &Manager{cfg: cfg, store: store, hub: hub, signer: signer, audit: a, log: log, sessions: map[string]*Session{}, idem: map[string]idemEntry{}, seenKeys: map[string]time.Time{}}
+	m := &Manager{cfg: cfg, store: store, hub: hub, signer: signer, signSem: make(chan struct{}, cfg.MaxConcurrentSigns), audit: a, log: log, sessions: map[string]*Session{}, idem: map[string]idemEntry{}, seenKeys: map[string]time.Time{}}
 	store.OnChange(m.onPolicyChange)
 	return m
+}
+
+func (m *Manager) signCert(ctx context.Context, req ca.Request) (*ssh.Certificate, error) {
+	select {
+	case m.signSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-m.signSem }()
+	return m.signer.SignUserCert(ctx, req)
 }
 
 func newID(prefix string) string {
@@ -348,9 +400,33 @@ func (m *Manager) gcLocked() {
 			delete(m.idem, k)
 		}
 	}
+	if len(m.idem) >= maxIdemEntries {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, e := range m.idem {
+			if oldestKey == "" || e.expires.Before(oldestExp) {
+				oldestKey, oldestExp = k, e.expires
+			}
+		}
+		if oldestKey != "" {
+			delete(m.idem, oldestKey)
+		}
+	}
 	for fp, t := range m.seenKeys {
 		if now.Sub(t) > keyReuseWindow {
 			delete(m.seenKeys, fp)
+		}
+	}
+	if len(m.seenKeys) >= maxSeenKeys {
+		var oldestFP string
+		var oldestAt time.Time
+		for fp, t := range m.seenKeys {
+			if oldestFP == "" || t.Before(oldestAt) {
+				oldestFP, oldestAt = fp, t
+			}
+		}
+		if oldestFP != "" {
+			delete(m.seenKeys, oldestFP)
 		}
 	}
 	for id, s := range m.sessions {
@@ -400,6 +476,30 @@ func (m *Manager) Close(u authz.Subject, id, reason string) (*Session, error) {
 	m.audit.Record(audit.Event{Actor: actor, Action: "session.close", Result: "ok", SessionID: id, Reason: reason})
 	m.terminate(s, StateClosed, reason)
 	return s, nil
+}
+
+// CloseUserSessions terminates every non-final session belonging to userID.
+// Used when an administrator revokes a user's access centrally.
+func (m *Manager) CloseUserSessions(userID, actorID, reason string) int {
+	m.mu.Lock()
+	var targets []*Session
+	for _, s := range m.sessions {
+		if s.Subject.UserID == userID {
+			targets = append(targets, s)
+		}
+	}
+	m.mu.Unlock()
+	closed := 0
+	for _, s := range targets {
+		st := s.State()
+		if final(st) || st == StateClosing {
+			continue
+		}
+		m.audit.Record(audit.Event{Actor: actorID, Action: "session.close", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, Reason: reason})
+		m.terminate(s, StateClosed, reason)
+		closed++
+	}
+	return closed
 }
 
 // terminate moves the session to closing then to its final state and tears
@@ -510,16 +610,21 @@ func (m *Manager) failure(s *Session, phase string, err error) string {
 	return reason
 }
 
-func (m *Manager) recheck(s *Session, phase string) bool {
-	d := m.store.Current().Check(s.Subject, s.HostID, s.Login)
+func (m *Manager) recheck(s *Session, phase string) (*authz.Snapshot, *authz.Host, bool) {
+	snap := m.store.Current()
+	d := snap.Check(s.Subject, s.HostID, s.Login)
 	if !d.Allowed {
 		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session." + phase, Result: "denied", SessionID: s.ID, Revision: d.Revision, Reason: d.Reason})
-		return false
+		return nil, nil, false
+	}
+	host, ok := snap.Host(s.HostID)
+	if !ok {
+		return nil, nil, false
 	}
 	s.mu.Lock()
 	s.policyRevision = d.Revision
 	s.mu.Unlock()
-	return true
+	return snap, host, true
 }
 
 func (m *Manager) run(s *Session, t Terminal) (string, *int) {
@@ -532,7 +637,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	if !s.transition(StateWaitingAgent, StateCreated) {
 		return "cancelled", nil
 	}
-	if !m.recheck(s, "open") {
+	if _, _, ok := m.recheck(s, "open"); !ok {
 		return "permission_denied", nil
 	}
 	attemptID := newID("a-")
@@ -552,11 +657,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	if !s.transition(StateSigning, StateWaitingAgent) {
 		return "cancelled", nil
 	}
-	if !m.recheck(s, "sign") {
-		return "permission_denied", nil
-	}
-	snap := m.store.Current()
-	host, ok := snap.Host(s.HostID)
+	snap, host, ok := m.recheck(s, "sign")
 	if !ok {
 		return "permission_denied", nil
 	}
@@ -565,7 +666,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 		return m.failure(s, "keygen", err), nil
 	}
 	req := ca.Request{PublicKey: key.PublicKey(), KeyID: "user:" + s.Subject.UserID + "/session:" + s.ID, Principal: authz.Principal(snap.Scope, s.HostID, s.Login)}
-	cert, err := m.signer.SignUserCert(ctx, req)
+	cert, err := m.signCert(ctx, req)
 	if err != nil {
 		m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ca.sign", Result: "error", SessionID: s.ID, AttemptID: attemptID})
 		return m.failure(s, "ca_sign", err), nil
@@ -591,6 +692,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 		}
 		return m.failure(s, "ssh_auth", err), nil
 	}
+	stream.MarkAuthenticated()
 	defer client.Close()
 	stopClient := context.AfterFunc(ctx, func() { _ = client.Close() })
 	defer stopClient()
@@ -619,7 +721,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	if ctx.Err() != nil {
 		return m.failure(s, "activate", ctx.Err()), nil
 	}
-	if !m.recheck(s, "activate") {
+	if _, _, ok := m.recheck(s, "activate"); !ok {
 		return "permission_denied", nil
 	}
 	if err := sess.Shell(); err != nil {
@@ -632,6 +734,8 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	if !s.transition(StateActive, StateSSHAuthenticating) {
 		return "cancelled", nil
 	}
+	stopIdle := s.startIdle(m.cfg.IdleTimeout)
+	defer stopIdle()
 	m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "session.active", Result: "ok", Target: s.HostID + "/" + s.Login, SessionID: s.ID, AttemptID: attemptID})
 
 	var outWG sync.WaitGroup
@@ -641,6 +745,7 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
+				s.touchIdle()
 				if t.Output(buf[:n]) != nil {
 					s.cancel(errors.New("browser_disconnected"))
 					return
@@ -681,6 +786,7 @@ func (s *Session) Input(p []byte) error {
 	if !active || w == nil {
 		return nil
 	}
+	s.touchIdle()
 	_, err := w.Write(p)
 	return err
 }
@@ -694,6 +800,7 @@ func (s *Session) Resize(rows, cols int) error {
 	if sess == nil {
 		return nil
 	}
+	s.touchIdle()
 	return sess.WindowChange(rows, cols)
 }
 

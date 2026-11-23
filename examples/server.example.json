@@ -34,20 +34,24 @@
     "timeout": "5s",
     "user_ca_public_key_file": "/etc/osmium/user_ca.pub",
     "max_cert_lifetime": "5m",
-    "allowed_extensions": ["permit-pty"]
+    "allowed_extensions": ["permit-pty"],
+    "required_source_address": ""
   },
 
   "sessions": {
     "attach_timeout": "60s",
     "ssh_handshake": "15s",
     "max_session_duration": "8h",
+    "idle_timeout": "30m",
     "max_per_user": 10,
     "max_total": 1000,
+    "max_concurrent_signs": 16,
     "revoke_active": true
   },
 
   "tunnel_ticket_ttl": "30s",
   "heartbeat_timeout": "45s",
   "stream_open_timeout": "10s",
-  "max_streams_per_agent": 32
+  "max_streams_per_agent": 32,
+  "max_pending_streams_per_agent": 8
 }

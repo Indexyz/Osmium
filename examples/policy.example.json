@@ -1,6 +1,7 @@
 {
   "scope": "t1",
   "admins": [{"group": "ssh-admins"}],
+  "disabled_users": [],
   "hosts": [
     {
       "id": "host-123",

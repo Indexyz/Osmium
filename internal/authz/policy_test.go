@@ -78,10 +78,50 @@ func TestParseRejects(t *testing.T) {
 		doc(`{"id":"g","subjects":[{"user_id":"u","group":"g"}],"hosts":{"ids":["host-123"]},"logins":["ops"]}`),
 		doc(`{"id":"g","subjects":[{"user_id":"u"}],"hosts":{},"logins":["ops"]}`),
 		strings.Replace(doc(""), `"scope"`, `"unknown":1,"scope"`, 1),
+		strings.Replace(doc(""), `"admins":`, `"disabled_users":[{"issuer":"only-issuer"}],"admins":`, 1),
 	}
 	for i, s := range bad {
 		if _, err := Parse(strings.NewReader(s)); err == nil {
 			t.Fatalf("case %d accepted", i)
 		}
+	}
+}
+
+func TestDisabledUsersOverrideGrantsAndAdmins(t *testing.T) {
+	raw := `{"scope":"t1",
+		"admins":[{"group":"admins"}],
+		"disabled_users":[{"user_id":"u-alice"},{"issuer":"https://idp","subject":"bob"},{"group":"suspended"}],
+		"hosts":[{"id":"host-123","policy_labels":{"env":"prod"},"allowed_login_users":["ops"],"ssh_host_keys":["` + hostKey + `"],"agent":{"id":"agent-123","client_cert_cn":"agent-123"}}],
+		"grants":[{"id":"g1","subjects":[{"group":"ops"},{"group":"admins"}],"hosts":{"ids":["host-123"]},"logins":["ops"]}]
+	}`
+	s := mustParse(t, raw)
+
+	aliceAdmin := Subject{UserID: "u-alice", Issuer: "https://idp", Sub: "alice", Groups: []string{"ops", "admins"}}
+	if !s.IsDisabled(aliceAdmin) {
+		t.Fatal("alice should be disabled")
+	}
+	if s.IsAdmin(aliceAdmin) {
+		t.Fatal("disabled user retained admin privilege")
+	}
+	if d := s.Check(aliceAdmin, "host-123", "ops"); d.Allowed || d.Reason != "user_disabled" {
+		t.Fatalf("expected user_disabled, got %+v", d)
+	}
+	if got := s.VisibleHosts(aliceAdmin); len(got) != 0 {
+		t.Fatalf("disabled user saw hosts: %v", got)
+	}
+
+	bobOps := Subject{UserID: "u-bob", Issuer: "https://idp", Sub: "bob", Groups: []string{"ops"}}
+	if d := s.Check(bobOps, "host-123", "ops"); d.Allowed || d.Reason != "user_disabled" {
+		t.Fatalf("bob expected user_disabled, got %+v", d)
+	}
+
+	carolSuspended := Subject{UserID: "u-carol", Issuer: "https://idp", Sub: "carol", Groups: []string{"ops", "suspended"}}
+	if d := s.Check(carolSuspended, "host-123", "ops"); d.Allowed || d.Reason != "user_disabled" {
+		t.Fatalf("suspended group expected user_disabled, got %+v", d)
+	}
+
+	dave := Subject{UserID: "u-dave", Issuer: "https://idp", Sub: "dave", Groups: []string{"ops", "admins"}}
+	if !s.IsAdmin(dave) || !s.Check(dave, "host-123", "ops").Allowed {
+		t.Fatal("unaffected active user denied")
 	}
 }

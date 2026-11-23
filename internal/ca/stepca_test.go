@@ -114,3 +114,45 @@ func TestCAUnavailable(t *testing.T) {
 		t.Fatal("expected timeout")
 	}
 }
+
+func TestVerifierRequiredSourceAddress(t *testing.T) {
+	f, _ := setup(t)
+	cfg, err := f.ClientConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantAddr = "127.0.0.1/32,::1/128"
+	cfg.RequiredSourceAddress = wantAddr
+	c, err := ca.NewStepCA(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing source-address must be rejected when required.
+	if _, err := c.SignUserCert(context.Background(), newReq(t)); err == nil {
+		t.Fatal("cert without source-address accepted")
+	}
+
+	// Exact loopback source-address passes.
+	f.SetMutate(func(x *ssh.Certificate) {
+		x.CriticalOptions = map[string]string{"source-address": wantAddr}
+	})
+	cert, err := c.SignUserCert(context.Background(), newReq(t))
+	if err != nil {
+		t.Fatalf("cert with matching source-address rejected: %v", err)
+	}
+	if cert.CriticalOptions["source-address"] != wantAddr {
+		t.Fatalf("got options %v", cert.CriticalOptions)
+	}
+
+	// Overly broad or extra critical options must be rejected.
+	for name, opts := range map[string]map[string]string{
+		"wildcard": {"source-address": "0.0.0.0/0"},
+		"extra":    {"source-address": wantAddr, "force-command": "id"},
+	} {
+		f.SetMutate(func(x *ssh.Certificate) { x.CriticalOptions = opts })
+		if _, err := c.SignUserCert(context.Background(), newReq(t)); err == nil {
+			t.Fatalf("%s: accepted %v", name, opts)
+		}
+	}
+}

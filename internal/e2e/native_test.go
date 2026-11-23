@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -381,10 +382,16 @@ func TestNativeAPIGuards(t *testing.T) {
 	if code, _ := call(extra); code != http.StatusBadRequest {
 		t.Fatal("extra field accepted")
 	}
-	// Cookie-authenticated native create needs CSRF; the tunnel needs a bearer.
+	// Cookie-authenticated native create is refused (Bearer required).
 	var v sessions.View
-	if code := alice.post("/api/v1/native-sessions", "", map[string]string{"host_id": "host-123", "login_user": e.login, "public_key": strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sp2)))}, &v); code != http.StatusCreated {
-		t.Fatalf("cookie create %d", code)
+	if code := alice.post("/api/v1/native-sessions", "", map[string]string{"host_id": "host-123", "login_user": e.login, "public_key": strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sp2)))}, &v); code != http.StatusForbidden {
+		t.Fatalf("cookie create %d, want 403", code)
+	}
+	// Bearer-created native session cannot be opened via cookie on /tunnel or as a web terminal.
+	if code, b := call(fmt.Sprintf(`{"host_id":"host-123","login_user":%q,"public_key":%q}`, e.login, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sp2))))); code != http.StatusCreated {
+		t.Fatalf("bearer create %d %s", code, b)
+	} else {
+		_ = json.Unmarshal([]byte(b), &v)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
