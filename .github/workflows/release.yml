@@ -260,9 +260,14 @@ jobs:
           }
 
           build_agent() {
-            local os="$1" arch="$2" goarm="${3:-}" suffix="$arch"
+            local os="$1" arch="$2" goarm="${3:-}"
+            local suffix="$arch"
             if [[ -n "$goarm" ]]; then suffix="armv${goarm}"; fi
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM="$goarm" go build -trimpath -ldflags "$LDFLAGS" -o "dist-release/osmium-agent" ./cmd/osmium-agent
+            if [[ -n "$goarm" ]]; then
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM="$goarm" go build -trimpath -ldflags "$LDFLAGS" -o "dist-release/osmium-agent" ./cmd/osmium-agent
+            else
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "dist-release/osmium-agent" ./cmd/osmium-agent
+            fi
             tar -C dist-release -czf "dist-release/osmium-agent_${VERSION}_${os}_${suffix}.tar.gz" osmium-agent
             rm dist-release/osmium-agent
           }
