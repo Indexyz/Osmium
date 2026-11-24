@@ -1,6 +1,6 @@
 {
   "name": "osmium",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Web & Native SSH access system powered by step-ca, smux v2, React and ghostty-web",
   "scripts": {
