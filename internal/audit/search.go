@@ -88,8 +88,9 @@ func (q Query) match(e *Event) bool {
 		(q.Target == "" || e.Target == q.Target)
 }
 
-// Search scans the segments of the days overlapping [From, To): local ones
-// (pending upload, or all of them without a Store) and uploaded ones.
+// Search queries the optional local SQLite index (if configured and applicable)
+// or scans the segments of the days overlapping [From, To): local ones (pending
+// upload, or all of them without a Store) and uploaded ones.
 func (l *Logger) Search(ctx context.Context, q Query) (Page, error) {
 	if q.From.IsZero() || q.To.IsZero() || !q.From.Before(q.To) {
 		return Page{}, fmt.Errorf("%w: from must be before to", ErrBadQuery)
@@ -99,6 +100,14 @@ func (l *Logger) Search(ctx context.Context, q Query) (Page, error) {
 	}
 	if q.Limit <= 0 || q.Limit > MaxLimit {
 		return Page{}, fmt.Errorf("%w: limit must be 1..%d", ErrBadQuery, MaxLimit)
+	}
+	// Ensure asynchronously queued records are persisted before reading.
+	l.Flush()
+	if l.cfg.SearchIndex != nil {
+		page, handled, err := l.cfg.SearchIndex(ctx, q)
+		if handled || err != nil {
+			return page, err
+		}
 	}
 	var cur cursor
 	if q.Cursor != "" {

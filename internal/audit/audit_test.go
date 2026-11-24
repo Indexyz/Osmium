@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -207,15 +208,17 @@ func TestLocalPersistsAcrossRestartAndDays(t *testing.T) {
 	if len(segs) != 3 {
 		t.Fatalf("segments %v", segs)
 	}
-	for _, seg := range segs {
-		st, err := os.Stat(filepath.Join(dir, seg))
-		if err != nil || st.Mode().Perm() != 0o600 {
-			t.Fatalf("%s: %v %v", seg, st.Mode(), err)
+	if runtime.GOOS != "windows" {
+		for _, seg := range segs {
+			st, err := os.Stat(filepath.Join(dir, seg))
+			if err != nil || st.Mode().Perm() != 0o600 {
+				t.Fatalf("%s: %v %v", seg, st.Mode(), err)
+			}
 		}
-	}
-	for _, d := range []string{dir, filepath.Join(dir, "2026-11-14")} {
-		if st, _ := os.Stat(d); st.Mode().Perm() != 0o700 {
-			t.Fatalf("%s mode %v", d, st.Mode())
+		for _, d := range []string{dir, filepath.Join(dir, "2026-11-14")} {
+			if st, _ := os.Stat(d); st.Mode().Perm() != 0o700 {
+				t.Fatalf("%s mode %v", d, st.Mode())
+			}
 		}
 	}
 }

@@ -104,13 +104,17 @@ func (c *nativeConn) State(state string) {
 	_ = c.text(protocol.TypeNativeState, protocol.TermState{State: state})
 }
 
-func (c *nativeConn) Ready(cert *ssh.Certificate, hostKeys []ssh.PublicKey) error {
+func (c *nativeConn) Ready(cert *ssh.Certificate, hostKeys, hostCAs []ssh.PublicKey, hostPrincipals []string) error {
 	r := protocol.NativeReady{
-		Certificate: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(cert))),
-		ValidBefore: time.Unix(int64(cert.ValidBefore), 0).UTC(),
+		Certificate:        strings.TrimSpace(string(ssh.MarshalAuthorizedKey(cert))),
+		HostCertPrincipals: hostPrincipals,
+		ValidBefore:        time.Unix(int64(cert.ValidBefore), 0).UTC(),
 	}
 	for _, k := range hostKeys {
 		r.HostKeys = append(r.HostKeys, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k))))
+	}
+	for _, k := range hostCAs {
+		r.HostCAs = append(r.HostCAs, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k))))
 	}
 	if err := c.text(protocol.TypeNativeReady, r); err != nil {
 		return err

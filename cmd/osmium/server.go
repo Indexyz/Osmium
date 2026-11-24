@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/spf13/cobra"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -16,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/indexyz/osmium/internal/agenthub"
 	"github.com/indexyz/osmium/internal/audit"
 	"github.com/indexyz/osmium/internal/authn"
@@ -24,6 +25,7 @@ import (
 	"github.com/indexyz/osmium/internal/config"
 	"github.com/indexyz/osmium/internal/server"
 	"github.com/indexyz/osmium/internal/sessions"
+	"github.com/indexyz/osmium/internal/storage"
 )
 
 func newServerCmd() *cobra.Command {
@@ -40,11 +42,23 @@ func newServerCmd() *cobra.Command {
 	return c
 }
 
-func openAudit(ctx context.Context, cfg *config.Server, log *slog.Logger) (*audit.Logger, error) {
-	ac := audit.Config{Dir: cfg.Audit.Dir, ServerID: cfg.ServerID, Retention: cfg.Audit.Retention.D(),
-		OnError: func(err error) { log.Error("audit", "err", err) }}
+func openAudit(ctx context.Context, cfg *config.Server, db *storage.SQLiteStore, log *slog.Logger) (*audit.Logger, error) {
+	ac := audit.Config{
+		Dir:       cfg.Audit.Dir,
+		ServerID:  cfg.ServerID,
+		Retention: cfg.Audit.Retention.D(),
+		OnError:   func(err error) { log.Error("audit", "err", err) },
+	}
 	if cfg.Audit.Stdout {
 		ac.Mirror = os.Stdout
+	}
+	if db != nil {
+		ac.OnBatch = db.InsertAuditBatch
+		if cfg.Audit.S3 == nil {
+			// When not merging remote S3 segments from other replicas, serve
+			// admin audit queries directly from the indexed local SQLite table.
+			ac.SearchIndex = db.SearchAudit
+		}
 	}
 	if s := cfg.Audit.S3; s != nil {
 		sc := audit.S3Config{Endpoint: s.Endpoint, Bucket: s.Bucket, Prefix: s.Prefix, Region: s.Region, AccessKeyID: s.AccessKeyID, CAFile: s.CAFile}
@@ -82,6 +96,44 @@ func readUserCAKeys(path string) ([]string, error) {
 	return out, nil
 }
 
+func loadInitialPolicy(cfg *config.Server, db *storage.SQLiteStore, log *slog.Logger) (*authz.Snapshot, error) {
+	if db != nil {
+		doc, ok, err := db.LoadDocument()
+		if err != nil {
+			return nil, fmt.Errorf("load state_db policy: %w", err)
+		}
+		if ok {
+			snap, err := authz.Build(doc)
+			if err != nil {
+				return nil, fmt.Errorf("build state_db policy: %w", err)
+			}
+			log.Info("loaded policy from state_db", "hosts", snap.HostCount(), "host_cas", len(snap.HostCAs()))
+			return snap, nil
+		}
+		if cfg.PolicyFile != "" {
+			snap, err := authz.LoadFile(cfg.PolicyFile)
+			if err != nil {
+				return nil, err
+			}
+			if err := db.SaveDocument(snap.Document()); err != nil {
+				return nil, fmt.Errorf("bootstrap state_db from policy_file: %w", err)
+			}
+			log.Info("bootstrapped state_db from policy_file", "policy_file", cfg.PolicyFile, "hosts", snap.HostCount())
+			return snap, nil
+		}
+		// Empty state_db without policy_file: start with an empty default scope.
+		snap, err := authz.Build(authz.Document{Scope: "default"})
+		if err != nil {
+			return nil, err
+		}
+		if err := db.SaveDocument(snap.Document()); err != nil {
+			return nil, err
+		}
+		return snap, nil
+	}
+	return authz.LoadFile(cfg.PolicyFile)
+}
+
 func runServer(cfgPath string, log *slog.Logger) error {
 	cfg, err := config.LoadServer(cfgPath)
 	if err != nil {
@@ -90,12 +142,30 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	snap, err := authz.LoadFile(cfg.PolicyFile)
+	var db *storage.SQLiteStore
+	if cfg.StateDB != "" {
+		db, err = storage.OpenSQLite(cfg.StateDB)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				log.Error("state_db close failed", "err", err)
+			}
+		}()
+		log.Info("state_db opened (SQLite WAL)", "path", cfg.StateDB)
+	}
+
+	snap, err := loadInitialPolicy(cfg, db, log)
 	if err != nil {
 		return err
 	}
 	store := authz.NewStore(snap)
-	aud, err := openAudit(ctx, cfg, log)
+	if db != nil {
+		store.SetPersister(db)
+	}
+
+	aud, err := openAudit(ctx, cfg, db, log)
 	if err != nil {
 		return err
 	}
@@ -121,10 +191,23 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	}
 
 	hub := agenthub.New(agenthub.Config{
-		ServerID: cfg.ServerID, Mux: cfg.Smux.Mux(), TicketTTL: cfg.TicketTTL.D(),
-		HeartbeatTimeout: cfg.HeartbeatTimeout.D(), StreamOpen: cfg.StreamOpen.D(),
-		MaxStreams: cfg.MaxStreams, MaxPendingStreams: cfg.MaxPendingStreams,
+		ServerID:          cfg.ServerID,
+		Mux:               cfg.Smux.Mux(),
+		PingInterval:      cfg.PingInterval.D(),
+		HeartbeatTimeout:  cfg.HeartbeatTimeout.D(),
+		MuxIdleTTL:        cfg.MuxIdleTTL.D(),
+		StreamOpen:        cfg.StreamOpen.D(),
+		MaxStreams:        cfg.MaxStreams,
+		MaxPendingStreams: cfg.MaxPendingStreams,
+		AcceptRate:        cfg.AgentAcceptRate,
+		AcceptBurst:       cfg.AgentAcceptBurst,
 	}, store, aud, log)
+	store.OnHostChange(func(snap *authz.Snapshot, agentIDs []string) {
+		for _, id := range agentIDs {
+			hub.ReconcileHost(snap, id)
+		}
+	})
+
 	revoke := true
 	if cfg.Sessions.RevokeActive != nil {
 		revoke = *cfg.Sessions.RevokeActive
@@ -135,6 +218,7 @@ func runServer(cfgPath string, log *slog.Logger) error {
 		MaxPerUser: cfg.Sessions.MaxPerUser, MaxTotal: cfg.Sessions.MaxTotal,
 		MaxConcurrentSigns: cfg.Sessions.MaxConcurrentSigns, RevokeActive: revoke,
 	}, store, hub, signer, aud, log)
+	defer mgr.Shutdown()
 
 	pub, err := url.Parse(cfg.PublicURL)
 	if err != nil || pub.Host == "" {
@@ -159,10 +243,18 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	if cfg.DevLogin {
 		log.Warn("dev_login is enabled: anyone reaching the web listener can log in as any user. Never enable in production.")
 	}
-	auth, err := authn.New(ctx, authn.Config{OIDC: oidcCfg, DevLogin: cfg.DevLogin, SessionTTL: cfg.WebSession.D(), SecureCookie: secure}, aud, log)
+	var sessStore authn.SessionStore
+	if db != nil {
+		sessStore = db
+	}
+	auth, err := authn.New(ctx, authn.Config{
+		OIDC: oidcCfg, DevLogin: cfg.DevLogin, SessionTTL: cfg.WebSession.D(), SecureCookie: secure, Store: sessStore,
+	}, aud, log)
 	if err != nil {
 		return err
 	}
+	defer auth.Shutdown()
+
 	store.OnChange(func(snap *authz.Snapshot) {
 		webN, cliN := auth.RevokeMatching(snap.IsDisabled)
 		if webN > 0 || cliN > 0 {
@@ -173,20 +265,22 @@ func runServer(cfgPath string, log *slog.Logger) error {
 
 	srv := &server.Server{Store: store, Hub: hub, Sessions: mgr, Auth: auth, Audit: aud, Log: log, AllowedOrigins: []string{pub.Scheme + "://" + pub.Host}}
 
-	// SIGHUP reloads the policy file; grants change without touching hosts.
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	go func() {
-		for range hup {
-			s, err := authz.LoadFile(cfg.PolicyFile)
-			if err != nil {
-				log.Error("policy reload failed; keeping current revision", "err", err)
-				continue
+	// SIGHUP reloads policy_file (when configured) and syncs to state_db.
+	if cfg.PolicyFile != "" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				s, err := authz.LoadFile(cfg.PolicyFile)
+				if err != nil {
+					log.Error("policy reload failed; keeping current revision", "err", err)
+					continue
+				}
+				store.Replace(s)
+				log.Info("policy reloaded", "revision", s.Revision, "hosts", s.HostCount())
 			}
-			store.Replace(s)
-			log.Info("policy reloaded", "revision", s.Revision)
-		}
-	}()
+		}()
+	}
 
 	clientCAs, err := os.ReadFile(cfg.AgentClientCA)
 	if err != nil {
@@ -219,7 +313,10 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	case err := <-errc:
 		return err
 	}
+	// Drain Agent handlers first so disconnect audit events flush cleanly before
+	// closing the audit logger and SQLite store.
 	hub.Shutdown()
+	hub.Wait(5 * time.Second)
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = webSrv.Shutdown(sctx)

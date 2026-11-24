@@ -117,7 +117,7 @@ func newFakeNativeClient(readyErr error) *fakeNativeClient {
 }
 
 func (c *fakeNativeClient) State(string) {}
-func (c *fakeNativeClient) Ready(*ssh.Certificate, []ssh.PublicKey) error {
+func (c *fakeNativeClient) Ready(*ssh.Certificate, []ssh.PublicKey, []ssh.PublicKey, []string) error {
 	close(c.readyCh)
 	return c.readyErr
 }

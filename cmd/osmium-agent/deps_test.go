@@ -18,8 +18,10 @@ func TestAgentDependencies(t *testing.T) {
 		"github.com/spf13/cobra",
 		"golang.org/x/crypto/ssh", "golang.org/x/oauth2", "github.com/coreos/go-oidc",
 		"github.com/go-jose/go-jose",
+		"modernc.org/sqlite",
 		"github.com/indexyz/osmium/internal/server", "github.com/indexyz/osmium/internal/client",
 		"github.com/indexyz/osmium/internal/sessions", "github.com/indexyz/osmium/internal/authn",
+		"github.com/indexyz/osmium/internal/storage",
 	}
 	for _, dep := range strings.Fields(string(out)) {
 		for _, f := range forbidden {

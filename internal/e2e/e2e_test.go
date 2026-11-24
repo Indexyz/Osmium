@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -317,32 +316,32 @@ func TestAgentRestartNewEpoch(t *testing.T) {
 	tm2.roundTrip("new-epoch")
 }
 
-// C02/C03/C04: unauthenticated agents are refused; a data ticket is single
-// use, bound to its agent, and concurrent replays succeed at most once.
-func TestAgentRegistrationAndTicket(t *testing.T) {
+// C02/C03/C04: unauthenticated agents are refused; duplicate registration
+// supersedes the old epoch cleanly; future-generation binary frames terminate
+// the tunnel.
+func TestAgentRegistrationAndTunnelGuards(t *testing.T) {
 	e := newEnv(t)
 	addr := "wss://" + e.agentSrv.Listener.Addr().String()
-	dial := func(cn, path, ticket string, sub string) (*websocket.Conn, *http.Response, error) {
+	dial := func(cn, path, sub string) (*websocket.Conn, *http.Response, error) {
 		tlsCfg := e.agentTLS(cn)
-		h := http.Header{}
-		if ticket != "" {
-			h.Set("Authorization", "Bearer "+ticket)
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return websocket.Dial(ctx, addr+path, &websocket.DialOptions{HTTPClient: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}, Subprotocols: []string{sub}, HTTPHeader: h})
+		return websocket.Dial(ctx, addr+path, &websocket.DialOptions{
+			HTTPClient:   &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}},
+			Subprotocols: []string{sub},
+		})
 	}
-	if _, resp, err := dial("agent-unknown", protocol.ControlPath, "", protocol.SubprotocolControl); err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
+	if _, resp, err := dial("agent-unknown", protocol.TunnelPath, protocol.SubprotocolTunnel); err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("unknown agent: %v", err)
 	}
-	ctrl, _, err := dial("agent-123", protocol.ControlPath, "", protocol.SubprotocolControl)
+	t1, _, err := dial("agent-123", protocol.TunnelPath, protocol.SubprotocolTunnel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ctrl.CloseNow()
+	defer t1.CloseNow()
 	hello, _ := protocol.Encode(protocol.TypeHello, protocol.Hello{AgentVersion: "t", ReportedLabels: map[string]string{}})
-	_ = ctrl.Write(context.Background(), websocket.MessageText, hello)
-	_, data, err := ctrl.Read(context.Background())
+	_ = t1.Write(context.Background(), websocket.MessageText, hello)
+	_, data, err := t1.Read(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,48 +349,45 @@ func TestAgentRegistrationAndTicket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := p.(*protocol.Welcome)
-	// Another agent's identity cannot use this ticket (and burns it).
-	if _, resp, err := dial("agent-456", protocol.DataPath, w.DataTicket, protocol.SubprotocolData); err == nil || resp.StatusCode != http.StatusForbidden {
-		t.Fatal("ticket accepted for a different agent identity")
+	w1 := p.(*protocol.Welcome)
+	if w1.HostID != "host-123" || w1.SmuxVersion != 2 {
+		t.Fatalf("unexpected welcome: %+v", w1)
 	}
-	// Fresh registration → fresh ticket; race two uses of it.
-	ctrl.CloseNow()
-	ctrl2, _, err := dial("agent-123", protocol.ControlPath, "", protocol.SubprotocolControl)
+
+	// Second registration with the same CN advances epoch and supersedes the first.
+	t2, _, err := dial("agent-123", protocol.TunnelPath, protocol.SubprotocolTunnel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ctrl2.CloseNow()
-	_ = ctrl2.Write(context.Background(), websocket.MessageText, hello)
-	_, data, _ = ctrl2.Read(context.Background())
-	_, p, _ = protocol.Decode(data)
+	defer t2.CloseNow()
+	_ = t2.Write(context.Background(), websocket.MessageText, hello)
+	_, data, err = t2.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, p, err = protocol.Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
 	w2 := p.(*protocol.Welcome)
-	if w2.Epoch <= w.Epoch {
+	if w2.Epoch <= w1.Epoch {
 		t.Fatal("epoch did not advance")
 	}
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	ok := 0
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			c, _, err := dial("agent-123", protocol.DataPath, w2.DataTicket, protocol.SubprotocolData)
-			if err == nil {
-				mu.Lock()
-				ok++
-				mu.Unlock()
-				t.Cleanup(func() { c.CloseNow() })
-			}
-		}()
+	// Old tunnel is closed by server.
+	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = t1.Read(rctx)
+	rcancel()
+	if err == nil {
+		t.Fatal("superseded tunnel stayed open")
 	}
-	wg.Wait()
-	if ok != 1 {
-		t.Fatalf("ticket used %d times", ok)
-	}
-	// Old epoch ticket is useless.
-	if _, resp, err := dial("agent-123", protocol.DataPath, w.DataTicket, protocol.SubprotocolData); err == nil || resp.StatusCode != http.StatusForbidden {
-		t.Fatal("stale ticket accepted")
+
+	// Sending an unsolicited future-generation binary frame closes the tunnel.
+	_ = t2.Write(context.Background(), websocket.MessageBinary, []byte{0x00, 0x00, 0x00, 0x05, 0x01, 0x02})
+	rctx2, rcancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = t2.Read(rctx2)
+	rcancel2()
+	if err == nil {
+		t.Fatal("tunnel survived unsolicited future-gen binary frame")
 	}
 }
 

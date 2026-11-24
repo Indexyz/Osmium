@@ -7,9 +7,10 @@
   "ssh_target": "127.0.0.1:22",
   "reported_labels": {"os": "linux"},
   "max_concurrent_streams": 32,
-  "heartbeat_interval": "15s",
+  "heartbeat_interval": "45s",
   "stream_open_timeout": "10s",
   "tcp_dial_timeout": "5s",
   "relay_drain_timeout": "5s",
-  "reconnect_max_backoff": "30s"
+  "reconnect_jitter": "30s",
+  "reconnect_max_backoff": "60s"
 }

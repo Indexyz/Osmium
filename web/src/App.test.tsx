@@ -44,7 +44,7 @@ describe("App", () => {
     expect(link).toHaveAttribute("href", "/auth/login");
   });
 
-  it("loads visible hosts and filters by policy labels", async () => {
+  it("loads visible hosts, filters by policy labels/keyword/status and paginates", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "/api/v1/me") {
@@ -58,6 +58,23 @@ describe("App", () => {
         );
       }
       if (url.startsWith("/api/v1/hosts")) {
+        if (url.includes("cursor=c2")) {
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: "host-456",
+                  display_name: "prod-web-2",
+                  status: "ready",
+                  policy_labels: { env: "prod" },
+                  allowed_login_users: ["ops"],
+                },
+              ],
+              total: 2,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
         return new Response(
           JSON.stringify({
             items: [
@@ -69,6 +86,8 @@ describe("App", () => {
                 allowed_login_users: ["ops", "deploy"],
               },
             ],
+            next_cursor: "c2",
+            total: 2,
           }),
           { status: 200, headers: { "Content-Type": "application/json" } }
         );
@@ -80,14 +99,25 @@ describe("App", () => {
     render(<App />);
     expect(await screen.findByText("prod-web-1")).toBeInTheDocument();
     expect(screen.getByText("Alice")).toBeInTheDocument();
+    expect(screen.getByText(/共 2 台匹配主机/)).toBeInTheDocument();
 
+    // Paginate to page 2 and back to page 1.
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    expect(await screen.findByText("prod-web-2")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith("/api/v1/hosts?cursor=c2", expect.anything())
+    );
+    fireEvent.click(screen.getByRole("button", { name: "上一页" }));
+    expect(await screen.findByText("prod-web-1")).toBeInTheDocument();
+
+    // Filter by labels + keyword.
     const filterInput = screen.getByPlaceholderText(/label 过滤/);
-    fireEvent.change(filterInput, { target: { value: "env=prod role=web" } });
+    fireEvent.change(filterInput, { target: { value: "env=prod role=web prod-1" } });
     fireEvent.click(screen.getByRole("button", { name: "刷新" }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/v1/hosts?label=env%3Dprod&label=role%3Dweb",
+        "/api/v1/hosts?label=env%3Dprod&label=role%3Dweb&q=prod-1",
         expect.anything()
       )
     );

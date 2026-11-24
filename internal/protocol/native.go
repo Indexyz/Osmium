@@ -24,11 +24,14 @@ const (
 )
 
 // NativeReady carries the signed certificate for the CLI's ephemeral key and
-// the pinned host keys the CLI must use for strict host key checking.
+// the pinned host keys and/or trusted SSH Host CAs the CLI must use for strict
+// host identity checking.
 type NativeReady struct {
-	Certificate string    `json:"certificate"` // authorized_keys format
-	HostKeys    []string  `json:"host_keys"`   // authorized_keys format
-	ValidBefore time.Time `json:"valid_before"`
+	Certificate        string    `json:"certificate"`                    // authorized_keys format
+	HostKeys           []string  `json:"host_keys,omitempty"`            // authorized_keys format
+	HostCAs            []string  `json:"host_cas,omitempty"`             // authorized_keys format
+	HostCertPrincipals []string  `json:"host_cert_principals,omitempty"` // expected principals when validating host cert
+	ValidBefore        time.Time `json:"valid_before"`
 }
 
 // NativeMessage is a decoded Server → CLI text message.
@@ -57,8 +60,8 @@ func DecodeNative(b []byte) (*NativeMessage, error) {
 	case TypeNativeReady:
 		m.Ready = &NativeReady{}
 		err = json.Unmarshal(env.Payload, m.Ready)
-		if err == nil && (m.Ready.Certificate == "" || len(m.Ready.HostKeys) == 0) {
-			err = errors.New("native.ready without certificate or host keys")
+		if err == nil && (m.Ready.Certificate == "" || (len(m.Ready.HostKeys) == 0 && len(m.Ready.HostCAs) == 0)) {
+			err = errors.New("native.ready without certificate or host identity")
 		}
 	case TypeNativeExit:
 		m.Exit = &TermExit{}

@@ -214,23 +214,67 @@ type Host struct {
 	AllowedLoginUsers []string          `json:"allowed_login_users"`
 }
 
-// Hosts lists visible hosts filtered by labels (key=value, AND).
-func (a *API) Hosts(ctx context.Context, labels []string) ([]Host, error) {
+// HostPageQuery filters and paginates visible hosts.
+type HostPageQuery struct {
+	Labels []string
+	Query  string
+	Status string
+	Cursor string
+	Limit  int
+}
+
+// HostPage is one paginated page from GET /api/v1/hosts.
+type HostPage struct {
+	Items      []Host `json:"items"`
+	NextCursor string `json:"next_cursor,omitempty"`
+	Total      int    `json:"total"`
+}
+
+// HostsPage fetches a single page of visible hosts.
+func (a *API) HostsPage(ctx context.Context, opt HostPageQuery) (HostPage, error) {
 	q := url.Values{}
-	for _, l := range labels {
+	for _, l := range opt.Labels {
 		q.Add("label", l)
+	}
+	if opt.Query != "" {
+		q.Set("q", opt.Query)
+	}
+	if opt.Status != "" {
+		q.Set("status", opt.Status)
+	}
+	if opt.Cursor != "" {
+		q.Set("cursor", opt.Cursor)
+	}
+	if opt.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", opt.Limit))
 	}
 	path := "/api/v1/hosts"
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
-	var out struct {
-		Items []Host `json:"items"`
-	}
+	var out HostPage
 	if err := a.do(ctx, http.MethodGet, path, nil, &out); err != nil {
-		return nil, err
+		return HostPage{}, err
 	}
-	return out.Items, nil
+	return out, nil
+}
+
+// Hosts lists all matching visible hosts by walking cursor pages (avoids the
+// 4 MiB single-response cap on 50k+ host fleets).
+func (a *API) Hosts(ctx context.Context, labels []string) ([]Host, error) {
+	var all []Host
+	cursor := ""
+	for {
+		page, err := a.HostsPage(ctx, HostPageQuery{Labels: labels, Cursor: cursor, Limit: 500})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Items...)
+		if page.NextCursor == "" || len(page.Items) == 0 {
+			return all, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 // Logout revokes the token on the Server.

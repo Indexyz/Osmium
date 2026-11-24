@@ -35,8 +35,8 @@ func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Durat
 // D returns the time.Duration.
 func (d Duration) D() time.Duration { return time.Duration(d) }
 
-// Smux mirrors tunnel.MuxConfig; zero values fall back to defaults. Both
-// ends must use identical values.
+// Smux mirrors tunnel.MuxConfig; zero values fall back to defaults. The Server
+// distributes these parameters dynamically in mux.open when activating smux.
 type Smux struct {
 	MaxFrameSize      int      `json:"max_frame_size"`
 	MaxReceiveBuffer  int      `json:"max_receive_buffer"`
@@ -78,15 +78,15 @@ type OIDC struct {
 
 // CA configures step-ca.
 type CA struct {
-	URL                 string   `json:"url"`
-	RootCAFile          string   `json:"root_ca_file"`
-	ProvisionerName     string   `json:"provisioner_name"`
-	JWKFile             string   `json:"jwk_file"`
-	JWKPasswordFile     string   `json:"jwk_password_file"`
-	Audience            string   `json:"audience"`
-	SignPath            string   `json:"sign_path"`
-	ValidBefore         string   `json:"valid_before"`
-	Timeout             Duration `json:"timeout"`
+	URL                   string   `json:"url"`
+	RootCAFile            string   `json:"root_ca_file"`
+	ProvisionerName       string   `json:"provisioner_name"`
+	JWKFile               string   `json:"jwk_file"`
+	JWKPasswordFile       string   `json:"jwk_password_file"`
+	Audience              string   `json:"audience"`
+	SignPath              string   `json:"sign_path"`
+	ValidBefore           string   `json:"valid_before"`
+	Timeout               Duration `json:"timeout"`
 	UserCAPublicKeyFile   string   `json:"user_ca_public_key_file"`
 	MaxCertLifetime       Duration `json:"max_cert_lifetime"`
 	AllowedExtensions     []string `json:"allowed_extensions"`
@@ -134,6 +134,7 @@ type Server struct {
 	TLSKey     string `json:"tls_key"`
 	PublicURL  string `json:"public_url"`
 	PolicyFile string `json:"policy_file"`
+	StateDB    string `json:"state_db"` // optional embedded SQLite WAL database path
 
 	AgentListen   string `json:"agent_listen"`
 	AgentTLSCert  string `json:"agent_tls_cert"`
@@ -150,29 +151,34 @@ type Server struct {
 	Sessions Sessions `json:"sessions"`
 	Smux     Smux     `json:"smux"`
 
-	TicketTTL         Duration `json:"tunnel_ticket_ttl"`
+	TicketTTL         Duration `json:"tunnel_ticket_ttl"` // deprecated; ignored in single-WSS protocol
+	PingInterval      Duration `json:"ping_interval"`
 	HeartbeatTimeout  Duration `json:"heartbeat_timeout"`
+	MuxIdleTTL        Duration `json:"mux_idle_ttl"`
 	StreamOpen        Duration `json:"stream_open_timeout"`
 	MaxStreams        int      `json:"max_streams_per_agent"`
 	MaxPendingStreams int      `json:"max_pending_streams_per_agent"`
+	AgentAcceptRate   float64  `json:"agent_accept_rate"`
+	AgentAcceptBurst  int      `json:"agent_accept_burst"`
 }
 
 // Agent is the agent configuration.
 type Agent struct {
-	ServerURL    string            `json:"server_url"` // wss://server:8443
-	ServerCA     string            `json:"server_ca"`
-	ServerName   string            `json:"server_name"`
-	ClientCert   string            `json:"client_cert"`
-	ClientKey    string            `json:"client_key"`
-	SSHTarget    string            `json:"ssh_target"`
-	Labels       map[string]string `json:"reported_labels"`
-	MaxStreams   int               `json:"max_concurrent_streams"`
-	Heartbeat    Duration          `json:"heartbeat_interval"`
-	StreamOpen   Duration          `json:"stream_open_timeout"`
-	TCPDial      Duration          `json:"tcp_dial_timeout"`
-	RelayDrain   Duration          `json:"relay_drain_timeout"`
-	ReconnectMax Duration          `json:"reconnect_max_backoff"`
-	Smux         Smux              `json:"smux"`
+	ServerURL       string            `json:"server_url"` // wss://server:8443
+	ServerCA        string            `json:"server_ca"`
+	ServerName      string            `json:"server_name"`
+	ClientCert      string            `json:"client_cert"`
+	ClientKey       string            `json:"client_key"`
+	SSHTarget       string            `json:"ssh_target"`
+	Labels          map[string]string `json:"reported_labels"`
+	MaxStreams      int               `json:"max_concurrent_streams"`
+	Heartbeat       Duration          `json:"heartbeat_interval"`
+	StreamOpen      Duration          `json:"stream_open_timeout"`
+	TCPDial         Duration          `json:"tcp_dial_timeout"`
+	RelayDrain      Duration          `json:"relay_drain_timeout"`
+	ReconnectJitter Duration          `json:"reconnect_jitter"`
+	ReconnectMax    Duration          `json:"reconnect_max_backoff"`
+	Smux            Smux              `json:"smux"`
 }
 
 func decode(path string, dst any) error {
@@ -200,8 +206,8 @@ func LoadServer(path string) (*Server, error) {
 	if c.AgentListen == "" {
 		c.AgentListen = ":8443"
 	}
-	if c.PolicyFile == "" || c.PublicURL == "" {
-		return nil, errors.New("config: policy_file and public_url are required")
+	if (c.PolicyFile == "" && c.StateDB == "") || c.PublicURL == "" {
+		return nil, errors.New("config: public_url and at least one of policy_file or state_db are required")
 	}
 	if c.AgentTLSCert == "" || c.AgentTLSKey == "" || c.AgentClientCA == "" {
 		return nil, errors.New("config: agent_tls_cert, agent_tls_key and agent_client_ca are required (Agent mTLS)")

@@ -120,7 +120,16 @@ func NewStepCA(cfg StepConfig) (*StepCA, error) {
 		cfg:    cfg,
 		signer: signer,
 		client: &http.Client{
-			Transport:     &http.Transport{TLSClientConfig: tlsCfg, Proxy: http.ProxyFromEnvironment},
+			Transport: &http.Transport{
+				TLSClientConfig:     tlsCfg,
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        128,
+				MaxIdleConnsPerHost: 64,
+				MaxConnsPerHost:     128,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+				ForceAttemptHTTP2:   true,
+			},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		verifier: v,

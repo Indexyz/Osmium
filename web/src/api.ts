@@ -124,19 +124,75 @@ export function fetchMe(signal?: AbortSignal): Promise<MeResponse> {
   return request<MeResponse>("/api/v1/me", { signal });
 }
 
-export function parseLabelFilterInput(raw: string): string[] {
-  return raw
+export interface HostsPageResponse {
+  items: HostItem[];
+  next_cursor?: string;
+  total: number;
+}
+
+export interface HostsQuery {
+  filter?: string;
+  status?: "" | HostStatus;
+  cursor?: string;
+  limit?: number;
+}
+
+export function parseHostFilterInput(raw: string): { labels: string[]; query: string } {
+  const tokens = raw
     .trim()
     .split(/\s+/)
     .filter(Boolean);
+  const labels: string[] = [];
+  const words: string[] = [];
+  for (const t of tokens) {
+    const eq = t.indexOf("=");
+    if (eq > 0 && eq < t.length - 1) {
+      labels.push(t);
+    } else {
+      words.push(t);
+    }
+  }
+  return { labels, query: words.join(" ") };
+}
+
+export function parseLabelFilterInput(raw: string): string[] {
+  return parseHostFilterInput(raw).labels;
+}
+
+export async function fetchHostsPage(
+  opts: HostsQuery = {},
+  signal?: AbortSignal
+): Promise<HostsPageResponse> {
+  const { labels, query } = parseHostFilterInput(opts.filter ?? "");
+  const params: string[] = [];
+  for (const l of labels) {
+    params.push(`label=${encodeURIComponent(l)}`);
+  }
+  if (query) {
+    params.push(`q=${encodeURIComponent(query)}`);
+  }
+  if (opts.status) {
+    params.push(`status=${encodeURIComponent(opts.status)}`);
+  }
+  if (opts.cursor) {
+    params.push(`cursor=${encodeURIComponent(opts.cursor)}`);
+  }
+  if (opts.limit && opts.limit > 0) {
+    params.push(`limit=${opts.limit}`);
+  }
+  const path = params.length > 0 ? `/api/v1/hosts?${params.join("&")}` : "/api/v1/hosts";
+  const data = await request<Partial<HostsPageResponse>>(path, { signal });
+  const items = data.items ?? [];
+  return {
+    items,
+    next_cursor: data.next_cursor || undefined,
+    total: typeof data.total === "number" ? data.total : items.length,
+  };
 }
 
 export async function fetchHosts(labelFilter: string, signal?: AbortSignal): Promise<HostItem[]> {
-  const parts = parseLabelFilterInput(labelFilter);
-  const query = parts.map((p) => `label=${encodeURIComponent(p)}`).join("&");
-  const path = query ? `/api/v1/hosts?${query}` : "/api/v1/hosts";
-  const data = await request<{ items: HostItem[] }>(path, { signal });
-  return data.items ?? [];
+  const page = await fetchHostsPage({ filter: labelFilter }, signal);
+  return page.items;
 }
 
 export function createSession(

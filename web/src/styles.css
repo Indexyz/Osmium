@@ -308,6 +308,24 @@ body {
   margin-top: 16px;
 }
 
+.pagination {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.pagination__meta {
+  font-size: 12px;
+}
+
+.pagination__actions {
+  display: flex;
+  gap: 6px;
+}
+
 /* Terminal shell — modeled on terminald's diagnostic full-viewport layout */
 
 .terminal-shell {

@@ -29,29 +29,37 @@ tenant:t1:host:host-123:login:ops
 
 ## 3. Agent mTLS
 
-为每个 Agent 签发客户端证书，CN 必须与策略中的 `agent.client_cert_cn` 一致。生产环境请用自己的 PKI。本地试用可以用：
+为每个 Agent 签发客户端证书，CN 必须与策略或数据库中的 `agent.client_cert_cn` 一致。生产环境请用自己的 PKI。本地试用可以用：
 
 ```sh
 osmium dev pki -o dev/pki --server-hosts localhost,127.0.0.1 --agents agent-123
 ```
 
-## 4. 策略
+Agent 仅向 Server 发起**一条 mTLS WSS**（`/agent/v1/tunnel`），并通过 `GetClientCertificate` 监听 `client_cert` / `client_key` 的文件修改时间自动热重载证书，证书轮换无需重启 `osmium-agent`。
+
+## 4. 策略、Host CA 与单二进制 SQLite 存储
 
 参考 [policy.example.json](../examples/policy.example.json)：
+- `host_ca_public_keys`（可选，大规模推荐）：信任的 SSH Host CA 公钥列表（`authorized_keys` 格式）。配置后，目标主机只需由该 CA 签发主机证书（默认校验 `host.id` 或主机自定义的 `host_cert_principals`），无需为每台机器逐一登记静态公钥。
 - `hosts`：每台主机需要填写
-  - `ssh_host_keys`：必填，来自 `/etc/ssh/ssh_host_*_key.pub`；
+  - `ssh_host_keys`：来自 `/etc/ssh/ssh_host_*_key.pub`（若全局已配置 `host_ca_public_keys` 则可留空）；
+  - `host_cert_principals`（可选）：校验主机证书时接受的 principal 列表，缺省为 `[host.id]`；
   - `allowed_login_users`；
   - `policy_labels`；
   - 绑定的 Agent。
 - `grants`：描述谁可以以哪些登录名访问哪些主机。主体可以是用户 ID、`issuer + subject` 或组；主机可以按 ID 或标签选择。
-- `admins`：管理员可以查看在线 Agent、审计日志和 CLI 令牌元数据，关闭他人会话，以及集中吊销单条 CLI 令牌（`POST /api/v1/admin/cli-tokens/{token_id}/revoke`）或一键吊销指定用户的全部登录态与活跃会话（`POST /api/v1/admin/users/{user_id}/revoke`），但不能观看他人终端。
+- `admins`：管理员可以查看在线 Agent、审计日志和 CLI 令牌元数据，增量增删改主机/授权/Host CA，关闭他人会话，以及集中吊销单条 CLI 令牌（`POST /api/v1/admin/cli-tokens/{token_id}/revoke`）或一键吊销指定用户的全部登录态与活跃会话（`POST /api/v1/admin/users/{user_id}/revoke`），但不能观看他人终端。
 - `disabled_users`：按 `user_id`、`issuer + subject` 或 `group` 禁用用户，优先级高于 `admins` 和 `grants`。
 
-修改策略文件后向 Server 发送 `SIGHUP` 即可热加载：
-- 授权被撤销或被加入 `disabled_users` 的用户的活跃会话会立即关闭（可通过 `sessions.revoke_active` 关闭对普通授权撤销的踢出行为），且被禁用用户的服务端 Web 会话与 CLI 令牌会立即清除；
-- 不需要改动主机。
+### 单二进制持久化（`state_db`）
 
-## 5. 启动
+对于超过数千台设备的部署，建议在 `server.json` 中配置 `"state_db": "/var/lib/osmium/osmium.db"`（使用内嵌纯 Go SQLite WAL，仍为单二进制零外部依赖）：
+- 首次启动若数据库为空且提供了 `policy_file`，会自动导入初始策略；
+- 之后可通过管理员增量 API（`PUT/DELETE /api/v1/admin/hosts/{id}`、`PUT/DELETE /api/v1/admin/grants/{id}`、`PUT /api/v1/admin/host-cas`）秒级修改单台主机或授权，仅精确影响目标主机，无需重写整个 `policy.json`；
+- Web 登录会话、CLI 令牌与审计索引均持久化在 `state_db` 中，Server 重启不丢登录态且审计检索走本地索引；
+- 仍兼容修改 `policy_file` 后向 Server 发送 `SIGHUP` 全量同步（未配置 `state_db` 时退回纯文件热加载）。
+
+## 5. 启动与 50,000+ 设备调优
 
 ```sh
 osmium server -c /etc/osmium/server.json   # 参考 examples/server.example.json
@@ -59,9 +67,12 @@ osmium-agent -c /etc/osmium-agent/agent.json  # 目标主机上运行，参考 e
 ```
 
 - 目标主机上应部署独立构建的 `osmium-agent`（`make agent`，交叉编译用 `make agent GOOS=linux GOARCH=arm64`）。它只包含 Agent 所需的代码，体积和内存占用都更小，适合性能和内存都有限的边缘设备。主程序里的 `osmium agent` 与它功能相同。
-- 内存非常紧张的设备上，可以在 systemd unit 中设置 `Environment=GOMEMLIMIT=24MiB`，让 GC 在接近这个上限时更积极地回收。也可以在 `agent.json` 的 `smux` 中调小 `max_receive_buffer`（默认 4 MiB）和 `max_stream_buffer`（默认 256 KiB），以限制隧道缓冲。注意 smux 参数必须与 Server 配置完全一致。
-
-- Server 的 Web 监听（`listen`）建议放在 HTTPS 反向代理之后，或直接配置 `tls_cert` / `tls_key`。进程存活检查可使用无认证只读接口 `GET /healthz`。
+- 内存非常紧张的设备上，可以在 systemd unit 中设置 `Environment=GOMEMLIMIT=24MiB`，让 GC 在接近这个上限时更积极地回收。`smux` 仅在有活跃 SSH 会话时按需激活并由 Server 统一下发参数，空闲 60 秒（可配 `mux_idle_ttl`）自动休眠释放缓冲。
+- **大规模（>50,000 台设备）部署建议**：
+  - 宿主机内核参数：`LimitNOFILE=200000`、`net.core.somaxconn=65535`、`net.ipv4.tcp_max_syn_backlog=65535`，保持 `net.ipv4.tcp_rmem`/`tcp_wmem` 最小值为 `4096` 以控制空闲连接内核内存；
+  - Agent 监听端口（`agent_listen`，默认 `:8443`）建议直接对外暴露或走 L4 透传（LVS/NLB），避免单出口 IP 的 L7 代理在回源单后端时触发源端口耗尽；
+  - 启用 `agent_accept_rate`（默认 4000/s）与 Agent 端 `reconnect_jitter`（默认 30s），平滑吸收全量重启重连；
+  - Server 的 Web 监听（`listen`）建议放在 HTTPS 反向代理之后，或直接配置 `tls_cert` / `tls_key`。进程存活检查可使用无认证只读接口 `GET /healthz`。
 - `public_url` 必须是浏览器实际访问的地址，用于 Origin 校验。
 - Agent 监听（`agent_listen`）强制 mTLS。
 - 稳定性限流参数：`max_pending_streams_per_agent`（默认 8，建议保持低于目标机 `sshd` 的 `MaxStartups`）、`sessions.max_concurrent_signs`（默认 16，保护 step-ca）与 `sessions.idle_timeout`（示例 `30m`，自动关闭闲置会话）。

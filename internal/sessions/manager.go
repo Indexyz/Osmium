@@ -112,7 +112,7 @@ type Attempt struct {
 	ValidBefore          time.Time `json:"valid_before,omitzero"`
 }
 
-// Session is one Web SSH session resource.
+// Session is one Web or native SSH session resource.
 type Session struct {
 	ID        string
 	Subject   authz.Subject
@@ -122,6 +122,8 @@ type Session struct {
 	Mode      string // ModeWeb or ModeNative
 
 	clientKey      ssh.PublicKey // native only: the CLI's ephemeral public key
+	onFinish       func()
+	finishOnce     sync.Once
 	mu             sync.Mutex
 	state          string
 	stateVersion   uint64
@@ -261,6 +263,9 @@ func (s *Session) finish(state, reason string) bool {
 	s.endedAt = time.Now()
 	ls := append([]func(string){}, s.listeners...)
 	s.mu.Unlock()
+	if s.onFinish != nil {
+		s.finishOnce.Do(s.onFinish)
+	}
 	close(s.done)
 	for _, l := range ls {
 		l(state)
@@ -268,7 +273,7 @@ func (s *Session) finish(state, reason string) bool {
 	return true
 }
 
-// Manager tracks sessions.
+// Manager tracks sessions with O(1) active quota accounting and background GC.
 type Manager struct {
 	cfg     Config
 	store   *authz.Store
@@ -278,10 +283,18 @@ type Manager struct {
 	audit   *audit.Logger
 	log     *slog.Logger
 
-	mu       sync.Mutex
-	sessions map[string]*Session
-	idem     map[string]idemEntry
-	seenKeys map[string]time.Time // native client key fingerprints (one key per attempt)
+	mu            sync.Mutex
+	sessions      map[string]*Session
+	activeTotal   int
+	activePerUser map[string]int
+	idem          map[string]idemEntry
+	idemOrder     []string
+	seenKeys      map[string]time.Time // native client key fingerprints (one key per attempt)
+	seenKeyOrder  []string
+
+	stopGC   chan struct{}
+	gcDone   chan struct{}
+	stopOnce sync.Once
 }
 
 type idemEntry struct {
@@ -290,12 +303,116 @@ type idemEntry struct {
 	expires   time.Time
 }
 
-// NewManager creates a Manager and subscribes it to policy changes.
+// NewManager creates a Manager, starts its periodic GC loop and subscribes it
+// to policy changes.
 func NewManager(cfg Config, store *authz.Store, hub Opener, signer ca.Signer, a *audit.Logger, log *slog.Logger) *Manager {
 	cfg.defaults()
-	m := &Manager{cfg: cfg, store: store, hub: hub, signer: signer, signSem: make(chan struct{}, cfg.MaxConcurrentSigns), audit: a, log: log, sessions: map[string]*Session{}, idem: map[string]idemEntry{}, seenKeys: map[string]time.Time{}}
+	m := &Manager{
+		cfg:           cfg,
+		store:         store,
+		hub:           hub,
+		signer:        signer,
+		signSem:       make(chan struct{}, cfg.MaxConcurrentSigns),
+		audit:         a,
+		log:           log,
+		sessions:      map[string]*Session{},
+		activePerUser: map[string]int{},
+		idem:          map[string]idemEntry{},
+		seenKeys:      map[string]time.Time{},
+		stopGC:        make(chan struct{}),
+		gcDone:        make(chan struct{}),
+	}
 	store.OnChange(m.onPolicyChange)
+	go m.gcLoop()
 	return m
+}
+
+// Shutdown stops the background GC loop.
+func (m *Manager) Shutdown() {
+	m.stopOnce.Do(func() { close(m.stopGC) })
+	<-m.gcDone
+}
+
+func (m *Manager) gcLoop() {
+	defer close(m.gcDone)
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stopGC:
+			return
+		case <-t.C:
+			m.gcExpired()
+		}
+	}
+}
+
+func (m *Manager) gcExpired() {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, e := range m.idem {
+		if now.After(e.expires) {
+			delete(m.idem, k)
+		}
+	}
+	m.compactIdemOrderLocked()
+	for fp, t := range m.seenKeys {
+		if now.Sub(t) > keyReuseWindow {
+			delete(m.seenKeys, fp)
+		}
+	}
+	m.compactSeenKeyOrderLocked()
+	for id, s := range m.sessions {
+		s.mu.Lock()
+		old := final(s.state) && now.Sub(s.endedAt) > m.cfg.Retention
+		s.mu.Unlock()
+		if old {
+			delete(m.sessions, id)
+		}
+	}
+}
+
+func (m *Manager) compactIdemOrderLocked() {
+	if len(m.idemOrder) <= len(m.idem)*2 {
+		return
+	}
+	kept := m.idemOrder[:0]
+	for _, k := range m.idemOrder {
+		if _, ok := m.idem[k]; ok {
+			kept = append(kept, k)
+		}
+	}
+	m.idemOrder = kept
+}
+
+func (m *Manager) compactSeenKeyOrderLocked() {
+	if len(m.seenKeyOrder) <= len(m.seenKeys)*2 {
+		return
+	}
+	kept := m.seenKeyOrder[:0]
+	for _, fp := range m.seenKeyOrder {
+		if _, ok := m.seenKeys[fp]; ok {
+			kept = append(kept, fp)
+		}
+	}
+	m.seenKeyOrder = kept
+}
+
+func (m *Manager) evictIdemIfFullLocked() {
+	for len(m.idem) >= maxIdemEntries && len(m.idemOrder) > 0 {
+		oldest := m.idemOrder[0]
+		m.idemOrder = m.idemOrder[1:]
+		delete(m.idem, oldest)
+	}
+}
+
+func (m *Manager) evictSeenKeyIfFullLocked() {
+	for len(m.seenKeys) >= maxSeenKeys && len(m.seenKeyOrder) > 0 {
+		oldest := m.seenKeyOrder[0]
+		m.seenKeyOrder = m.seenKeyOrder[1:]
+		delete(m.seenKeys, oldest)
+	}
 }
 
 func (m *Manager) signCert(ctx context.Context, req ca.Request) (*ssh.Certificate, error) {
@@ -324,6 +441,22 @@ type CreateRequest struct {
 	BodyHash string
 }
 
+// precheckAdmit evaluates policy and agent readiness OUTSIDE m.mu so disk/hub
+// calls never contend with the session map lock.
+func (m *Manager) precheckAdmit(u authz.Subject, hostID, login, mode string) (authz.Decision, error) {
+	snap := m.store.Current()
+	d := snap.Check(u, hostID, login)
+	if !d.Allowed {
+		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: hostID + "/" + login, Revision: d.Revision, Reason: d.Reason, Extra: map[string]any{"mode": mode}})
+		return d, ErrForbidden
+	}
+	host, _ := snap.Host(hostID)
+	if m.hub.Status(host) != "ready" {
+		return d, ErrUnavailable
+	}
+	return d, nil
+}
+
 // Create validates and creates a session resource. It returns created=false
 // when an identical idempotent request already produced a session.
 func (m *Manager) Create(u authz.Subject, r CreateRequest) (*Session, bool, error) {
@@ -331,57 +464,111 @@ func (m *Manager) Create(u authz.Subject, r CreateRequest) (*Session, bool, erro
 		return nil, false, ErrInvalid
 	}
 	idemKey := u.UserID + "\x00" + r.IdemKey
+	now := time.Now()
+
+	// Fast idempotency check before checking host readiness.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.gcLocked()
 	if e, ok := m.idem[idemKey]; ok {
-		if e.bodyHash != r.BodyHash {
+		if now.After(e.expires) {
+			delete(m.idem, idemKey)
+		} else {
+			if e.bodyHash != r.BodyHash {
+				m.mu.Unlock()
+				return nil, false, ErrConflict
+			}
+			if s := m.sessions[e.sessionID]; s != nil {
+				m.mu.Unlock()
+				return s, false, nil
+			}
+			m.mu.Unlock()
 			return nil, false, ErrConflict
 		}
-		if s := m.sessions[e.sessionID]; s != nil {
-			return s, false, nil
-		}
-		return nil, false, ErrConflict
 	}
-	s, err := m.admitLocked(u, r.HostID, r.Login, ModeWeb)
+	m.mu.Unlock()
+
+	d, err := m.precheckAdmit(u, r.HostID, r.Login, ModeWeb)
 	if err != nil {
 		return nil, false, err
 	}
+
+	m.mu.Lock()
+	if e, ok := m.idem[idemKey]; ok && !now.After(e.expires) {
+		if e.bodyHash != r.BodyHash {
+			m.mu.Unlock()
+			return nil, false, ErrConflict
+		}
+		if s := m.sessions[e.sessionID]; s != nil {
+			m.mu.Unlock()
+			return s, false, nil
+		}
+		m.mu.Unlock()
+		return nil, false, ErrConflict
+	}
+	s, err := m.registerLocked(u, r.HostID, r.Login, ModeWeb, d.Revision)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, false, err
+	}
 	s.rows, s.cols = r.Rows, r.Cols
-	m.idem[idemKey] = idemEntry{bodyHash: r.BodyHash, sessionID: s.ID, expires: time.Now().Add(24 * time.Hour)}
+	m.evictIdemIfFullLocked()
+	m.idem[idemKey] = idemEntry{bodyHash: r.BodyHash, sessionID: s.ID, expires: now.Add(24 * time.Hour)}
+	m.idemOrder = append(m.idemOrder, idemKey)
+	m.mu.Unlock()
+
+	m.postRegister(s, d.Revision)
 	return s, true, nil
 }
 
-// admitLocked authorizes and registers a new session. m.mu must be held.
-func (m *Manager) admitLocked(u authz.Subject, hostID, login, mode string) (*Session, error) {
-	snap := m.store.Current()
-	d := snap.Check(u, hostID, login)
-	if !d.Allowed {
-		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: hostID + "/" + login, Revision: d.Revision, Reason: d.Reason, Extra: map[string]any{"mode": mode}})
-		return nil, ErrForbidden
-	}
-	host, _ := snap.Host(hostID)
-	if m.hub.Status(host) != "ready" {
-		return nil, ErrUnavailable
-	}
-	perUser, total := 0, 0
-	for _, s := range m.sessions {
-		if final(s.State()) {
-			continue
-		}
-		total++
-		if s.Subject.UserID == u.UserID {
-			perUser++
-		}
-	}
-	if perUser >= m.cfg.MaxPerUser || total >= m.cfg.MaxTotal {
+// registerLocked enforces O(1) active session quotas and inserts s into
+// m.sessions. m.mu must be held; no I/O or cross-subsystem locks are taken.
+func (m *Manager) registerLocked(u authz.Subject, hostID, login, mode string, rev uint64) (*Session, error) {
+	if m.activePerUser[u.UserID] >= m.cfg.MaxPerUser || m.activeTotal >= m.cfg.MaxTotal {
 		return nil, ErrLimitReached
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
-	s := &Session{ID: newID("s-"), Subject: u, HostID: hostID, Login: login, CreatedAt: time.Now().UTC(), Mode: mode,
-		state: StateCreated, policyRevision: d.Revision, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	uid := u.UserID
+	s := &Session{
+		ID:             newID("s-"),
+		Subject:        u,
+		HostID:         hostID,
+		Login:          login,
+		CreatedAt:      time.Now().UTC(),
+		Mode:           mode,
+		state:          StateCreated,
+		policyRevision: rev,
+		ctx:            ctx,
+		cancel:         cancel,
+		done:           make(chan struct{}),
+		onFinish: func() {
+			m.mu.Lock()
+			if m.activeTotal > 0 {
+				m.activeTotal--
+			}
+			if n := m.activePerUser[uid]; n <= 1 {
+				delete(m.activePerUser, uid)
+			} else {
+				m.activePerUser[uid] = n - 1
+			}
+			m.mu.Unlock()
+		},
+	}
 	m.sessions[s.ID] = s
-	m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "ok", Target: hostID + "/" + login, SessionID: s.ID, Revision: d.Revision, Extra: map[string]any{"mode": mode}})
+	m.activeTotal++
+	m.activePerUser[uid]++
+	return s, nil
+}
+
+func (m *Manager) postRegister(s *Session, rev uint64) {
+	m.audit.Record(audit.Event{
+		Actor:     "user:" + s.Subject.UserID,
+		User:      s.Subject.Name,
+		Action:    "session.create",
+		Result:    "ok",
+		Target:    s.HostID + "/" + s.Login,
+		SessionID: s.ID,
+		Revision:  rev,
+		Extra:     map[string]any{"mode": s.Mode},
+	})
 	time.AfterFunc(m.cfg.AttachTimeout, func() {
 		s.mu.Lock()
 		attached := s.attached
@@ -390,53 +577,6 @@ func (m *Manager) admitLocked(u authz.Subject, hostID, login, mode string) (*Ses
 			m.terminate(s, StateFailed, "attach_timeout")
 		}
 	})
-	return s, nil
-}
-
-func (m *Manager) gcLocked() {
-	now := time.Now()
-	for k, e := range m.idem {
-		if now.After(e.expires) {
-			delete(m.idem, k)
-		}
-	}
-	if len(m.idem) >= maxIdemEntries {
-		var oldestKey string
-		var oldestExp time.Time
-		for k, e := range m.idem {
-			if oldestKey == "" || e.expires.Before(oldestExp) {
-				oldestKey, oldestExp = k, e.expires
-			}
-		}
-		if oldestKey != "" {
-			delete(m.idem, oldestKey)
-		}
-	}
-	for fp, t := range m.seenKeys {
-		if now.Sub(t) > keyReuseWindow {
-			delete(m.seenKeys, fp)
-		}
-	}
-	if len(m.seenKeys) >= maxSeenKeys {
-		var oldestFP string
-		var oldestAt time.Time
-		for fp, t := range m.seenKeys {
-			if oldestFP == "" || t.Before(oldestAt) {
-				oldestFP, oldestAt = fp, t
-			}
-		}
-		if oldestFP != "" {
-			delete(m.seenKeys, oldestFP)
-		}
-	}
-	for id, s := range m.sessions {
-		s.mu.Lock()
-		old := final(s.state) && now.Sub(s.endedAt) > m.cfg.Retention
-		s.mu.Unlock()
-		if old {
-			delete(m.sessions, id)
-		}
-	}
 }
 
 // Get returns a session visible to u (owner or admin).
@@ -453,12 +593,16 @@ func (m *Manager) Get(u authz.Subject, id string) (*Session, error) {
 // List returns sessions visible to u.
 func (m *Manager) List(u authz.Subject) []View {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []View
+	var targets []*Session
 	for _, s := range m.sessions {
 		if s.Subject.UserID == u.UserID || u.IsAdmin {
-			out = append(out, s.View())
+			targets = append(targets, s)
 		}
+	}
+	m.mu.Unlock()
+	out := make([]View, 0, len(targets))
+	for _, s := range targets {
+		out = append(out, s.View())
 	}
 	return out
 }
@@ -684,7 +828,13 @@ func (m *Manager) run(s *Session, t Terminal) (string, *int) {
 	if !s.transition(StateSSHAuthenticating, StateSigning) {
 		return "cancelled", nil
 	}
-	client, err := sshgateway.Connect(ctx, stream, sshgateway.Target{HostID: s.HostID, Login: s.Login, HostKeys: host.HostKeys()}, key, cert, m.cfg.SSHHandshake)
+	client, err := sshgateway.Connect(ctx, stream, sshgateway.Target{
+		HostID:             s.HostID,
+		Login:              s.Login,
+		HostKeys:           host.HostKeys(),
+		HostCAs:            snap.HostCAs(),
+		HostCertPrincipals: host.CertPrincipals(),
+	}, key, cert, m.cfg.SSHHandshake)
 	if err != nil {
 		if errors.Is(err, sshgateway.ErrHostKeyMismatch) || strings.Contains(err.Error(), sshgateway.ErrHostKeyMismatch.Error()) {
 			m.audit.Record(audit.Event{Actor: "user:" + s.Subject.UserID, User: s.Subject.Name, Action: "ssh.host_key", Result: "mismatch", Target: s.HostID, SessionID: s.ID})
@@ -800,11 +950,10 @@ func (s *Session) Resize(rows, cols int) error {
 	if sess == nil {
 		return nil
 	}
-	s.touchIdle()
 	return sess.WindowChange(rows, cols)
 }
 
-// BodyHash hashes a canonical request body for idempotency.
+// BodyHash hashes canonical request fields for idempotency checks.
 func BodyHash(parts ...string) string {
 	h := sha256.New()
 	for _, p := range parts {

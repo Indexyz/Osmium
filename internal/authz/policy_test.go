@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -123,5 +124,70 @@ func TestDisabledUsersOverrideGrantsAndAdmins(t *testing.T) {
 	dave := Subject{UserID: "u-dave", Issuer: "https://idp", Sub: "dave", Groups: []string{"ops", "admins"}}
 	if !s.IsAdmin(dave) || !s.Check(dave, "host-123", "ops").Allowed {
 		t.Fatal("unaffected active user denied")
+	}
+}
+
+func TestIndexedPaginationAndHostCAValidation(t *testing.T) {
+	// 1) Build 10,000 hosts using Host CA (no per-host static keys needed).
+	const totalHosts = 10000
+	hosts := make([]*Host, 0, totalHosts)
+	for i := 0; i < totalHosts; i++ {
+		env := "dev"
+		if i%2 == 0 {
+			env = "prod"
+		}
+		id := fmt.Sprintf("host-%05d", i)
+		hosts = append(hosts, &Host{
+			ID:                id,
+			DisplayName:       "node-" + id,
+			PolicyLabels:      map[string]string{"env": env, "shard": fmt.Sprintf("s%d", i%10)},
+			AllowedLoginUsers: []string{"ops"},
+			Agent:             AgentBinding{ID: "agent-" + id, ClientCertCN: "agent-" + id},
+		})
+	}
+	snap, err := Build(Document{
+		Scope:            "scale",
+		HostCAPublicKeys: []string{hostKey},
+		Hosts:            hosts,
+		Grants: []Grant{{
+			ID:       "g-prod",
+			Subjects: []SubjectSelector{{UserID: "u-alice"}},
+			Hosts:    HostSelector{Labels: map[string]string{"env": "prod"}},
+			Logins:   []string{"ops"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Filter by shard=s0 & env=prod -> 1000 hosts; walk cursor pages cleanly.
+	seen := 0
+	cursor := ""
+	for {
+		p := snap.VisibleHostsPage(alice, HostPageQuery{
+			Labels: map[string]string{"shard": "s0"},
+			Cursor: cursor,
+			Limit:  200,
+		}, func(*Host) string { return "ready" })
+		if p.Total != 1000 {
+			t.Fatalf("total=%d, want 1000", p.Total)
+		}
+		for _, item := range p.Items {
+			if item.Host.PolicyLabels["env"] != "prod" || item.Host.PolicyLabels["shard"] != "s0" {
+				t.Fatalf("unexpected host in page: %+v", item.Host)
+			}
+			seen++
+		}
+		if p.NextCursor == "" {
+			break
+		}
+		cursor = p.NextCursor
+	}
+	if seen != 1000 {
+		t.Fatalf("walked %d hosts, want 1000", seen)
+	}
+	// Label filter for unauthorized env=dev must never widen visibility.
+	pDev := snap.VisibleHostsPage(alice, HostPageQuery{Labels: map[string]string{"env": "dev"}, Limit: 10}, nil)
+	if pDev.Total != 0 || len(pDev.Items) != 0 {
+		t.Fatalf("dev label widened visibility: %+v", pDev)
 	}
 }

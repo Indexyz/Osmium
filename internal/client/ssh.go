@@ -55,23 +55,31 @@ func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) 
 // sshToken escapes % for ssh_config token expansion.
 func sshToken(s string) string { return strings.ReplaceAll(s, "%", "%%") }
 
-// ResolveLogin picks the login for hostID when none was given.
+// ResolveLogin picks the login for hostID when none was given, querying only
+// matching host entries instead of pulling the full fleet directory.
 func (a *API) ResolveLogin(ctx context.Context, hostID, login string) (string, error) {
 	if login != "" {
 		return login, nil
 	}
-	hosts, err := a.Hosts(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	for _, h := range hosts {
-		if h.ID != hostID {
-			continue
+	cursor := ""
+	for {
+		page, err := a.HostsPage(ctx, HostPageQuery{Query: hostID, Cursor: cursor, Limit: 50})
+		if err != nil {
+			return "", err
 		}
-		if len(h.AllowedLoginUsers) == 1 {
-			return h.AllowedLoginUsers[0], nil
+		for _, h := range page.Items {
+			if h.ID != hostID {
+				continue
+			}
+			if len(h.AllowedLoginUsers) == 1 {
+				return h.AllowedLoginUsers[0], nil
+			}
+			return "", fmt.Errorf("host %s allows several logins (%s); use login@%s", hostID, strings.Join(h.AllowedLoginUsers, ", "), hostID)
 		}
-		return "", fmt.Errorf("host %s allows several logins (%s); use login@%s", hostID, strings.Join(h.AllowedLoginUsers, ", "), hostID)
+		if page.NextCursor == "" || len(page.Items) == 0 {
+			break
+		}
+		cursor = page.NextCursor
 	}
 	return "", fmt.Errorf("host %s not found or not accessible", hostID)
 }
@@ -148,6 +156,20 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 		}
 		hostKeys = append(hostKeys, hk)
 	}
+	var hostCAs []ssh.PublicKey
+	for _, k := range ready.HostCAs {
+		caKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k))
+		if err != nil {
+			return 0, errors.New("server returned an invalid host CA key")
+		}
+		if _, isCert := caKey.(*ssh.Certificate); isCert {
+			return 0, errors.New("server returned a certificate as host CA")
+		}
+		hostCAs = append(hostCAs, caKey)
+	}
+	if len(hostKeys) == 0 && len(hostCAs) == 0 {
+		return 0, errors.New("server returned neither pinned host keys nor host CAs")
+	}
 
 	dir, err := os.MkdirTemp("", "osmium-")
 	if err != nil {
@@ -158,9 +180,26 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 		return 0, err
 	}
 	alias := "osmium-" + o.HostID
+	if len(hostCAs) > 0 {
+		// When verifying a Host Certificate, OpenSSH checks the HostKeyAlias
+		// against the certificate's principals.
+		alias = o.HostID
+		if len(ready.HostCertPrincipals) > 0 && ready.HostCertPrincipals[0] != "" {
+			alias = ready.HostCertPrincipals[0]
+		}
+	}
 	var kh strings.Builder
 	for _, k := range hostKeys {
 		kh.WriteString(alias + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k))) + "\n")
+	}
+	if len(hostCAs) > 0 {
+		principals := alias
+		if len(ready.HostCertPrincipals) > 0 {
+			principals = strings.Join(ready.HostCertPrincipals, ",")
+		}
+		for _, caKey := range hostCAs {
+			kh.WriteString("@cert-authority " + principals + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(caKey))) + "\n")
+		}
 	}
 	khPath := filepath.Join(dir, "known_hosts")
 	certPath := filepath.Join(dir, "id-cert.pub")

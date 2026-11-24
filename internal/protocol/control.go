@@ -1,6 +1,5 @@
-// Package protocol defines the Agent control channel messages (version 1,
-// api/control.schema.json) and the browser terminal text messages
-// (api/terminal.schema.json).
+// Package protocol defines the Agent single-WSS control messages (version 1)
+// and the browser terminal text messages.
 package protocol
 
 import (
@@ -11,32 +10,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/indexyz/osmium/internal/tunnel"
 )
 
-// WebSocket subprotocols.
+// WebSocket subprotocols and paths.
 const (
-	SubprotocolControl  = "web-ssh-control.v1"
-	SubprotocolData     = "web-ssh-data.v1"
+	// SubprotocolTunnel is the unified single-WSS Agent protocol:
+	//   - WebSocket Ping/Pong: keepalive
+	//   - WebSocket Text:      JSON control messages (version 1)
+	//   - WebSocket Binary:    [4B big-endian mux_gen][smux v2 bytes]
+	SubprotocolTunnel   = "web-ssh-tunnel.v2"
 	SubprotocolTerminal = "web-ssh-terminal.v1"
 
-	ControlPath = "/agent/v1/control"
-	DataPath    = "/agent/v1/data"
+	TunnelPath = "/agent/v1/tunnel"
 
-	// MaxControlMessage bounds a single control JSON message.
+	// MaxControlMessage bounds a single JSON control text frame.
 	MaxControlMessage = 64 * 1024
+	// MaxBinaryMessage bounds a single binary WebSocket frame carrying
+	// [4B mux_gen][smux v2 frame]. smux MaxFrameSize is capped at 32 KiB + 8B header.
+	MaxBinaryMessage = 128 * 1024
 )
 
-// Control message types.
+// Control message types (carried in WebSocket text frames).
 const (
-	TypeHello     = "agent.hello"
-	TypeWelcome   = "agent.welcome"
-	TypeHeartbeat = "agent.heartbeat"
-	TypeDataReady = "agent.data_ready"
-	TypeClose     = "session.close"
-	TypeClosed    = "session.closed"
+	TypeHello    = "agent.hello"
+	TypeWelcome  = "agent.welcome"
+	TypeMuxOpen  = "mux.open"
+	TypeMuxClose = "mux.close"
+	TypeClose    = "session.close"
+	TypeClosed   = "session.closed"
 )
 
 // validID is shared with the stream prelude so both channels accept the same IDs.
@@ -50,32 +53,65 @@ type Envelope struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
+// Hello is sent by the Agent as the first text frame after mTLS WSS upgrade.
 type Hello struct {
 	AgentVersion   string            `json:"agent_version"`
 	ReportedLabels map[string]string `json:"reported_labels"`
 }
 
+// Welcome binds the Agent connection to its server-assigned identity and epoch.
 type Welcome struct {
-	AgentID      string    `json:"agent_id"`
-	HostID       string    `json:"host_id"`
-	Epoch        uint64    `json:"connection_epoch"`
-	DataTunnelID string    `json:"data_tunnel_id"`
-	DataPath     string    `json:"data_path"`
-	DataTicket   string    `json:"data_ticket"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	SmuxVersion  int       `json:"smux_version"`
+	AgentID        string `json:"agent_id"`
+	HostID         string `json:"host_id"`
+	Epoch          uint64 `json:"connection_epoch"`
+	TunnelID       string `json:"tunnel_id"`
+	SmuxVersion    int    `json:"smux_version"`
+	PingIntervalMs int    `json:"ping_interval_ms"`
+	PingTimeoutMs  int    `json:"ping_timeout_ms"`
 }
 
-type Heartbeat struct {
-	Epoch         uint64 `json:"connection_epoch"`
-	DataTunnelID  string `json:"data_tunnel_id"`
-	DataConnected bool   `json:"data_connected"`
-	ActiveStreams int    `json:"active_streams"`
+// SmuxParams carries bounded, server-dictated smux v2 parameters for an
+// on-demand mux generation.
+type SmuxParams struct {
+	MaxFrameSize        int `json:"max_frame_size"`
+	MaxReceiveBuffer    int `json:"max_receive_buffer"`
+	MaxStreamBuffer     int `json:"max_stream_buffer"`
+	KeepAliveIntervalMs int `json:"keepalive_interval_ms"`
+	KeepAliveTimeoutMs  int `json:"keepalive_timeout_ms"`
 }
 
-type DataReady struct {
-	Epoch        uint64 `json:"connection_epoch"`
-	DataTunnelID string `json:"data_tunnel_id"`
+// Validate checks that SmuxParams stay within safe memory and liveness bounds.
+func (s SmuxParams) Validate() error {
+	if s.MaxFrameSize < 1024 || s.MaxFrameSize > 32*1024 {
+		return errors.New("max_frame_size out of bounds")
+	}
+	if s.MaxReceiveBuffer < 64*1024 || s.MaxReceiveBuffer > 16*1024*1024 {
+		return errors.New("max_receive_buffer out of bounds")
+	}
+	if s.MaxStreamBuffer < 16*1024 || s.MaxStreamBuffer > 4*1024*1024 || s.MaxStreamBuffer > s.MaxReceiveBuffer {
+		return errors.New("max_stream_buffer out of bounds")
+	}
+	if s.KeepAliveIntervalMs < 1000 || s.KeepAliveIntervalMs > 300_000 {
+		return errors.New("keepalive_interval_ms out of bounds")
+	}
+	if s.KeepAliveTimeoutMs < s.KeepAliveIntervalMs*2 || s.KeepAliveTimeoutMs > 600_000 {
+		return errors.New("keepalive_timeout_ms out of bounds")
+	}
+	return nil
+}
+
+// MuxOpen activates an on-demand smux v2 session bound to MuxGen on the shared WSS.
+type MuxOpen struct {
+	Epoch  uint64     `json:"connection_epoch"`
+	MuxGen uint32     `json:"mux_gen"`
+	Smux   SmuxParams `json:"smux"`
+}
+
+// MuxClose retires an idle or superseded smux v2 session without closing the WSS.
+type MuxClose struct {
+	Epoch  uint64 `json:"connection_epoch"`
+	MuxGen uint32 `json:"mux_gen"`
+	Reason string `json:"reason"`
 }
 
 // SessionClose is used for both session.close and session.closed.
@@ -137,10 +173,10 @@ func Decode(b []byte) (string, any, error) {
 		p = &Hello{}
 	case TypeWelcome:
 		p = &Welcome{}
-	case TypeHeartbeat:
-		p = &Heartbeat{}
-	case TypeDataReady:
-		p = &DataReady{}
+	case TypeMuxOpen:
+		p = &MuxOpen{}
+	case TypeMuxClose:
+		p = &MuxClose{}
 	case TypeClose, TypeClosed:
 		p = &SessionClose{}
 	default:
@@ -161,9 +197,9 @@ func deref(p any) any {
 		return *v
 	case *Welcome:
 		return *v
-	case *Heartbeat:
+	case *MuxOpen:
 		return *v
-	case *DataReady:
+	case *MuxClose:
 		return *v
 	case *SessionClose:
 		return *v
@@ -185,16 +221,20 @@ func validatePayload(typ string, p any) error {
 		}
 	case Welcome:
 		if typ != TypeWelcome || !validID(v.AgentID) || !validID(v.HostID) || v.Epoch == 0 ||
-			!validID(v.DataTunnelID) || v.DataPath != DataPath || len(v.DataTicket) < 16 || len(v.DataTicket) > 2048 ||
-			v.ExpiresAt.IsZero() || v.SmuxVersion != 2 {
+			!validID(v.TunnelID) || v.SmuxVersion != 2 ||
+			v.PingIntervalMs < 200 || v.PingIntervalMs > 600_000 ||
+			v.PingTimeoutMs < v.PingIntervalMs*2 || v.PingTimeoutMs > 1_800_000 {
 			return bad("fields")
 		}
-	case Heartbeat:
-		if typ != TypeHeartbeat || v.Epoch == 0 || !validID(v.DataTunnelID) || v.ActiveStreams < 0 {
+	case MuxOpen:
+		if typ != TypeMuxOpen || v.Epoch == 0 || v.MuxGen == 0 {
 			return bad("fields")
 		}
-	case DataReady:
-		if typ != TypeDataReady || v.Epoch == 0 || !validID(v.DataTunnelID) {
+		if err := v.Smux.Validate(); err != nil {
+			return bad(err.Error())
+		}
+	case MuxClose:
+		if typ != TypeMuxClose || v.Epoch == 0 || v.MuxGen == 0 || len(v.Reason) > 256 {
 			return bad("fields")
 		}
 	case SessionClose:

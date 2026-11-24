@@ -23,14 +23,15 @@ type MuxConfig struct {
 	KeepAliveTimeout  time.Duration
 }
 
-// DefaultMuxConfig returns the experimental starting point from docs/05 §4.
+// DefaultMuxConfig returns the bounded smux v2 configuration used when an
+// on-demand mux generation is activated.
 func DefaultMuxConfig() MuxConfig {
 	return MuxConfig{
 		MaxFrameSize:      16 * 1024,
 		MaxReceiveBuffer:  4 * 1024 * 1024,
 		MaxStreamBuffer:   256 * 1024,
-		KeepAliveInterval: 10 * time.Second,
-		KeepAliveTimeout:  30 * time.Second,
+		KeepAliveInterval: 30 * time.Second,
+		KeepAliveTimeout:  90 * time.Second,
 	}
 }
 
@@ -48,11 +49,40 @@ func (c MuxConfig) smux() (*smux.Config, error) {
 	return s, nil
 }
 
-// NewGatewayMux wraps an authenticated data WebSocket as the smux client side.
+// NewGatewayMuxConn wraps a per-generation ReadWriteCloser (such as *GenConn)
+// as the smux v2 client side without installing an external supervisor. The
+// caller is responsible for monitoring AcceptStream() (the Agent must never
+// initiate streams toward the Gateway).
+func NewGatewayMuxConn(rwc io.ReadWriteCloser, c MuxConfig) (*smux.Session, error) {
+	cfg, err := c.smux()
+	if err != nil {
+		return nil, err
+	}
+	mux, err := smux.Client(rwc, cfg)
+	if err != nil {
+		_ = rwc.Close()
+		return nil, err
+	}
+	return mux, nil
+}
+
+// NewAgentMuxConn wraps a per-generation ReadWriteCloser (such as *GenConn) as
+// the smux v2 server side.
+func NewAgentMuxConn(rwc io.ReadWriteCloser, c MuxConfig) (*smux.Session, error) {
+	cfg, err := c.smux()
+	if err != nil {
+		return nil, err
+	}
+	mux, err := smux.Server(rwc, cfg)
+	if err != nil {
+		_ = rwc.Close()
+		return nil, err
+	}
+	return mux, nil
+}
+
+// NewGatewayMux wraps a standalone binary WebSocket as the smux client side.
 // ctx must belong to the whole Agent tunnel, never to one SSH session.
-// It also supervises the session: smux does not close a Session on a socket
-// read or protocol error, and the Agent must never open streams towards the
-// Gateway, so either condition closes the whole tunnel (CloseChan fires).
 func NewGatewayMux(ctx context.Context, ws *websocket.Conn, c MuxConfig) (*smux.Session, error) {
 	mux, err := newMux(ctx, ws, c, smux.Client)
 	if err != nil {
@@ -67,8 +97,7 @@ func NewGatewayMux(ctx context.Context, ws *websocket.Conn, c MuxConfig) (*smux.
 	return mux, nil
 }
 
-// NewAgentMux wraps the data WebSocket as the smux server side. The Agent dials
-// the WebSocket but accepts streams opened by the Gateway.
+// NewAgentMux wraps a standalone binary WebSocket as the smux server side.
 func NewAgentMux(ctx context.Context, ws *websocket.Conn, c MuxConfig) (*smux.Session, error) {
 	return newMux(ctx, ws, c, smux.Server)
 }

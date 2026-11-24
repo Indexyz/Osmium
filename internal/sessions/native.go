@@ -75,28 +75,54 @@ func (m *Manager) CreateNative(u authz.Subject, r NativeRequest) (*Session, erro
 		return nil, err
 	}
 	fp := sshgateway.Fingerprint(key)
+	now := time.Now()
+
+	// Check key reuse first so replayed keys fail quickly before touching Hub.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.gcLocked()
-	if _, seen := m.seenKeys[fp]; seen {
-		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: r.HostID + "/" + r.Login, Reason: "key_reused", Extra: map[string]any{"mode": ModeNative, "fingerprint": fp}})
-		return nil, ErrKeyReused
+	if seenAt, seen := m.seenKeys[fp]; seen {
+		if now.Sub(seenAt) > keyReuseWindow {
+			delete(m.seenKeys, fp)
+		} else {
+			m.mu.Unlock()
+			m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: r.HostID + "/" + r.Login, Reason: "key_reused", Extra: map[string]any{"mode": ModeNative, "fingerprint": fp}})
+			return nil, ErrKeyReused
+		}
 	}
-	s, err := m.admitLocked(u, r.HostID, r.Login, ModeNative)
+	m.mu.Unlock()
+
+	d, err := m.precheckAdmit(u, r.HostID, r.Login, ModeNative)
 	if err != nil {
 		return nil, err
 	}
-	m.seenKeys[fp] = time.Now()
+
+	m.mu.Lock()
+	if seenAt, seen := m.seenKeys[fp]; seen && now.Sub(seenAt) <= keyReuseWindow {
+		m.mu.Unlock()
+		m.audit.Record(audit.Event{Actor: "user:" + u.UserID, User: u.Name, Action: "session.create", Result: "denied", Target: r.HostID + "/" + r.Login, Reason: "key_reused", Extra: map[string]any{"mode": ModeNative, "fingerprint": fp}})
+		return nil, ErrKeyReused
+	}
+	s, err := m.registerLocked(u, r.HostID, r.Login, ModeNative, d.Revision)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.evictSeenKeyIfFullLocked()
+	m.seenKeys[fp] = now
+	m.seenKeyOrder = append(m.seenKeyOrder, fp)
 	s.clientKey = key
+	m.mu.Unlock()
+
+	m.postRegister(s, d.Revision)
 	return s, nil
 }
 
 // NativeClient is the CLI side of a native session.
 type NativeClient interface {
 	State(state string)
-	// Ready hands the certificate and pinned host keys to the CLI; after it
-	// returns, Read/Write carry raw SSH bytes only.
-	Ready(cert *ssh.Certificate, hostKeys []ssh.PublicKey) error
+	// Ready hands the certificate, pinned host keys and/or trusted Host CAs
+	// (with expected host certificate principals) to the CLI; after it returns,
+	// Read/Write carry raw SSH bytes only.
+	Ready(cert *ssh.Certificate, hostKeys, hostCAs []ssh.PublicKey, hostPrincipals []string) error
 	// CloseRead unblocks any pending Read without closing the write path so
 	// the caller can still deliver native.exit cleanly.
 	CloseRead()
@@ -185,7 +211,7 @@ func (m *Manager) runNative(s *Session, c NativeClient) string {
 	if _, _, ok := m.recheck(s, "activate"); !ok {
 		return "permission_denied"
 	}
-	if err := c.Ready(cert, host.HostKeys()); err != nil {
+	if err := c.Ready(cert, host.HostKeys(), snap.HostCAs(), host.CertPrincipals()); err != nil {
 		return "client_disconnected"
 	}
 	if !s.transition(StateActive, StateSigning) {

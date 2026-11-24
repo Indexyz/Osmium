@@ -17,16 +17,6 @@ import (
 	"github.com/indexyz/osmium/internal/audit"
 )
 
-// CLI login: the osmium CLI starts a loopback listener and opens
-//
-//	GET /auth/cli?port=P&state=S&code_challenge=C
-//
-// in the user's browser. A logged-in user confirms (POST, CSRF protected) and
-// is redirected to http://127.0.0.1:P/callback?code=..&state=.. . The CLI then
-// exchanges the code with its PKCE verifier at POST /auth/cli/token for an
-// opaque Bearer token. Codes are single use and short lived; tokens are kept
-// as hashes only and are separate from Web sessions.
-
 const (
 	cliCodeTTL    = 2 * time.Minute
 	cliTokenPfx   = "osm_"
@@ -106,10 +96,6 @@ button{font-size:1rem;padding:.5rem 1.2rem}code{background:#eee;padding:0 .3em}<
 
 const cliPageTail = `</body></html>`
 
-// The page is assembled by hand rather than with html/template: the template
-// engine looks methods up by name via reflection, which stops the linker
-// from pruning unused methods and costs about 2 MiB of binary size. Every
-// dynamic value goes through html.EscapeString.
 func writeCLIPage(w io.Writer, body string) {
 	_, _ = io.WriteString(w, cliPageHead+body+cliPageTail)
 }
@@ -176,19 +162,24 @@ func (a *Authenticator) HandleCLIApprove(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	code := random(32)
-	a.mu.Lock()
+	k := key(code)
 	now := time.Now()
-	for k, c := range a.cliCodes {
-		if now.After(c.expires) {
-			delete(a.cliCodes, k)
+	a.mu.Lock()
+	for len(a.cliCodes) >= maxPendingCLI && len(a.cliCodeOrder) > 0 {
+		oldest := a.cliCodeOrder[0]
+		if c, ok := a.cliCodes[oldest]; ok && !now.After(c.expires) {
+			break
 		}
+		a.cliCodeOrder = a.cliCodeOrder[1:]
+		delete(a.cliCodes, oldest)
 	}
 	if len(a.cliCodes) >= maxPendingCLI {
 		a.mu.Unlock()
 		http.Error(w, "too many pending CLI logins", http.StatusServiceUnavailable)
 		return
 	}
-	a.cliCodes[key(code)] = cliCode{user: s.User, challenge: p.Challenge, expires: now.Add(cliCodeTTL)}
+	a.cliCodes[k] = cliCode{user: s.User, challenge: p.Challenge, expires: now.Add(cliCodeTTL)}
+	a.cliCodeOrder = append(a.cliCodeOrder, k)
 	a.mu.Unlock()
 	a.audit.Record(audit.Event{Actor: "user:" + s.User.ID, User: s.User.DisplayName, Action: "cli.authorize", Result: "ok"})
 	// Only ever redirect to the loopback interface of the user's machine.
@@ -209,9 +200,10 @@ func (a *Authenticator) HandleCLIToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "INVALID_REQUEST")
 		return
 	}
+	ck := key(body.Code)
 	a.mu.Lock()
-	c, ok := a.cliCodes[key(body.Code)]
-	delete(a.cliCodes, key(body.Code)) // single use, even on failure
+	c, ok := a.cliCodes[ck]
+	delete(a.cliCodes, ck) // single use, even on failure
 	a.mu.Unlock()
 	sum := sha256.Sum256([]byte(body.Verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
@@ -221,28 +213,30 @@ func (a *Authenticator) HandleCLIToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := cliTokenPfx + random(32)
+	tk := key(tok)
 	now := time.Now().UTC()
 	t := &CLIToken{ID: "ct-" + random(9), User: c.user, CreatedAt: now, ExpiresAt: now.Add(a.cfg.SessionTTL)}
+	var evicted []string
 	a.mu.Lock()
-	for k, v := range a.cliTokens {
-		if now.After(v.ExpiresAt) {
-			delete(a.cliTokens, k)
+	for len(a.cliTokens) >= maxCLITokens && len(a.cliTokenOrder) > 0 {
+		oldest := a.cliTokenOrder[0]
+		a.cliTokenOrder = a.cliTokenOrder[1:]
+		if _, exists := a.cliTokens[oldest]; exists {
+			delete(a.cliTokens, oldest)
+			evicted = append(evicted, oldest)
 		}
 	}
-	if len(a.cliTokens) >= maxCLITokens {
-		var oldestKey string
-		var oldestTime time.Time
-		for k, v := range a.cliTokens {
-			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
-				oldestKey, oldestTime = k, v.CreatedAt
-			}
-		}
-		if oldestKey != "" {
-			delete(a.cliTokens, oldestKey)
-		}
-	}
-	a.cliTokens[key(tok)] = t
+	a.cliTokens[tk] = t
+	a.cliTokenOrder = append(a.cliTokenOrder, tk)
 	a.mu.Unlock()
+	if a.store != nil {
+		for _, ek := range evicted {
+			_ = a.store.DeleteCLIToken(ek)
+		}
+		if err := a.store.SaveCLIToken(tk, t); err != nil && a.log != nil {
+			a.log.Error("persist cli token failed", "err", err)
+		}
+	}
 	a.audit.Record(audit.Event{Actor: "user:" + c.user.ID, User: c.user.DisplayName, Action: "cli.token", Result: "ok", Extra: map[string]any{"token_id": t.ID}})
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -276,25 +270,38 @@ func (a *Authenticator) LookupBearer(r *http.Request) (*CLIToken, bool) {
 	if t == "" {
 		return nil, false
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	c, ok := a.cliTokens[key(t)]
+	tk := key(t)
 	now := time.Now().UTC()
+	a.mu.Lock()
+	c, ok := a.cliTokens[tk]
 	if !ok || now.After(c.ExpiresAt) {
-		delete(a.cliTokens, key(t))
+		delete(a.cliTokens, tk)
+		a.mu.Unlock()
+		if ok && a.store != nil {
+			_ = a.store.DeleteCLIToken(tk)
+		}
 		return nil, false
 	}
+	shouldTouch := now.Sub(c.LastUsedAt) >= time.Minute
 	c.LastUsedAt = now
 	cp := *c
+	a.mu.Unlock()
+	if shouldTouch && a.store != nil {
+		_ = a.store.TouchCLIToken(tk, now)
+	}
 	return &cp, true
 }
 
 // RevokeBearer deletes the request's CLI token.
 func (a *Authenticator) RevokeBearer(r *http.Request) {
 	if t := bearer(r); t != "" {
+		tk := key(t)
 		a.mu.Lock()
-		delete(a.cliTokens, key(t))
+		delete(a.cliTokens, tk)
 		a.mu.Unlock()
+		if a.store != nil {
+			_ = a.store.DeleteCLIToken(tk)
+		}
 	}
 }
 
@@ -330,13 +337,22 @@ func (a *Authenticator) ListCLITokens() []CLITokenInfo {
 // RevokeCLITokenByID removes one CLI token by its non-secret metadata ID.
 func (a *Authenticator) RevokeCLITokenByID(id string) (CLITokenInfo, bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	var rmKey string
+	var info CLITokenInfo
 	for k, c := range a.cliTokens {
 		if c.ID == id {
-			info := tokenInfo(c)
+			info = tokenInfo(c)
+			rmKey = k
 			delete(a.cliTokens, k)
-			return info, true
+			break
 		}
 	}
-	return CLITokenInfo{}, false
+	a.mu.Unlock()
+	if rmKey == "" {
+		return CLITokenInfo{}, false
+	}
+	if a.store != nil {
+		_ = a.store.DeleteCLIToken(rmKey)
+	}
+	return info, true
 }

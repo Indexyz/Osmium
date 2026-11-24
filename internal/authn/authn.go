@@ -1,6 +1,7 @@
 // Package authn handles Web login: OIDC authorization code flow with PKCE,
-// server-side Web sessions in an HttpOnly cookie, and CSRF tokens. The OIDC
-// ID token is used once at login and never kept as a signing credential.
+// server-side Web sessions in an HttpOnly cookie, CLI Bearer tokens and CSRF
+// tokens. The OIDC ID token is used once at login and never kept as a signing
+// credential. An optional SessionStore persists sessions/tokens across restarts.
 package authn
 
 import (
@@ -10,6 +11,7 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -56,6 +58,20 @@ type WebSession struct {
 	ExpiresAt time.Time
 }
 
+// SessionStore optionally persists Web sessions and CLI tokens across restarts
+// (implemented by internal/storage). All keys passed to it are hex-encoded
+// SHA-256 digests, never raw secret cookies or tokens.
+type SessionStore interface {
+	LoadWebSessions(now time.Time) (map[string]*WebSession, error)
+	SaveWebSession(keyHex string, s *WebSession) error
+	DeleteWebSession(keyHex string) error
+	LoadCLITokens(now time.Time) (map[string]*CLIToken, error)
+	SaveCLIToken(keyHex string, t *CLIToken) error
+	TouchCLIToken(keyHex string, usedAt time.Time) error
+	DeleteCLIToken(keyHex string) error
+	PruneAuth(now time.Time) error
+}
+
 // OIDCConfig configures the identity provider.
 type OIDCConfig struct {
 	Issuer       string
@@ -72,23 +88,33 @@ type Config struct {
 	DevLogin     bool // local development only: /auth/dev-login?user=NAME
 	SessionTTL   time.Duration
 	SecureCookie bool
+	Store        SessionStore
 }
 
-// Authenticator implements login and session lookup.
+// Authenticator implements login and session lookup with O(1) capacity eviction
+// and optional SQLite persistence.
 type Authenticator struct {
 	cfg      Config
 	provider *oidc.Provider
 	verifier *oidc.IDTokenVerifier
 	oauth    *oauth2.Config
+	store    SessionStore
 	audit    *audit.Logger
 	log      *slog.Logger
 
-	mu       sync.Mutex
-	sessions map[string]*WebSession // key: sha256(cookie)
-	pending  map[string]pendingLogin
+	mu            sync.Mutex
+	sessions      map[string]*WebSession // key: hex(sha256(cookie))
+	sessionOrder  []string
+	pending       map[string]pendingLogin
+	pendingOrder  []string
+	cliCodes      map[string]cliCode // key: hex(sha256(code))
+	cliCodeOrder  []string
+	cliTokens     map[string]*CLIToken // key: hex(sha256(token))
+	cliTokenOrder []string
 
-	cliCodes  map[string]cliCode   // key: sha256(code)
-	cliTokens map[string]*CLIToken // key: sha256(token)
+	stopGC   chan struct{}
+	gcDone   chan struct{}
+	stopOnce sync.Once
 }
 
 type pendingLogin struct {
@@ -96,12 +122,24 @@ type pendingLogin struct {
 	expires                               time.Time
 }
 
-// New creates the authenticator, discovering the OIDC provider if set.
+// New creates the authenticator, discovering the OIDC provider if set and
+// restoring persisted Web sessions and CLI tokens when a Store is attached.
 func New(ctx context.Context, cfg Config, a *audit.Logger, log *slog.Logger) (*Authenticator, error) {
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 8 * time.Hour
 	}
-	au := &Authenticator{cfg: cfg, audit: a, log: log, sessions: map[string]*WebSession{}, pending: map[string]pendingLogin{}, cliCodes: map[string]cliCode{}, cliTokens: map[string]*CLIToken{}}
+	au := &Authenticator{
+		cfg:       cfg,
+		store:     cfg.Store,
+		audit:     a,
+		log:       log,
+		sessions:  map[string]*WebSession{},
+		pending:   map[string]pendingLogin{},
+		cliCodes:  map[string]cliCode{},
+		cliTokens: map[string]*CLIToken{},
+		stopGC:    make(chan struct{}),
+		gcDone:    make(chan struct{}),
+	}
 	if cfg.OIDC == nil && !cfg.DevLogin {
 		return nil, errors.New("authn: configure oidc (or dev_login for local development)")
 	}
@@ -118,7 +156,112 @@ func New(ctx context.Context, cfg Config, a *audit.Logger, log *slog.Logger) (*A
 		au.verifier = p.Verifier(&oidc.Config{ClientID: cfg.OIDC.ClientID})
 		au.oauth = &oauth2.Config{ClientID: cfg.OIDC.ClientID, ClientSecret: cfg.OIDC.ClientSecret, RedirectURL: cfg.OIDC.RedirectURL, Endpoint: p.Endpoint(), Scopes: scopes}
 	}
+	if au.store != nil {
+		now := time.Now().UTC()
+		if ws, err := au.store.LoadWebSessions(now); err != nil {
+			return nil, fmt.Errorf("authn: load web sessions: %w", err)
+		} else {
+			for k, s := range ws {
+				au.sessions[k] = s
+				au.sessionOrder = append(au.sessionOrder, k)
+			}
+		}
+		if ct, err := au.store.LoadCLITokens(now); err != nil {
+			return nil, fmt.Errorf("authn: load cli tokens: %w", err)
+		} else {
+			for k, t := range ct {
+				au.cliTokens[k] = t
+				au.cliTokenOrder = append(au.cliTokenOrder, k)
+			}
+		}
+	}
+	go au.gcLoop()
 	return au, nil
+}
+
+// Shutdown stops the background expiration loop.
+func (a *Authenticator) Shutdown() {
+	a.stopOnce.Do(func() { close(a.stopGC) })
+	<-a.gcDone
+}
+
+func (a *Authenticator) gcLoop() {
+	defer close(a.gcDone)
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.stopGC:
+			return
+		case <-t.C:
+			now := time.Now().UTC()
+			a.mu.Lock()
+			for k, v := range a.sessions {
+				if now.After(v.ExpiresAt) {
+					delete(a.sessions, k)
+				}
+			}
+			for k, v := range a.pending {
+				if now.After(v.expires) {
+					delete(a.pending, k)
+				}
+			}
+			for k, v := range a.cliCodes {
+				if now.After(v.expires) {
+					delete(a.cliCodes, k)
+				}
+			}
+			for k, v := range a.cliTokens {
+				if now.After(v.ExpiresAt) {
+					delete(a.cliTokens, k)
+				}
+			}
+			a.compactOrdersLocked()
+			a.mu.Unlock()
+			if a.store != nil {
+				_ = a.store.PruneAuth(now)
+			}
+		}
+	}
+}
+
+func (a *Authenticator) compactOrdersLocked() {
+	if len(a.sessionOrder) > len(a.sessions)*2 {
+		kept := a.sessionOrder[:0]
+		for _, k := range a.sessionOrder {
+			if _, ok := a.sessions[k]; ok {
+				kept = append(kept, k)
+			}
+		}
+		a.sessionOrder = kept
+	}
+	if len(a.cliTokenOrder) > len(a.cliTokens)*2 {
+		kept := a.cliTokenOrder[:0]
+		for _, k := range a.cliTokenOrder {
+			if _, ok := a.cliTokens[k]; ok {
+				kept = append(kept, k)
+			}
+		}
+		a.cliTokenOrder = kept
+	}
+	if len(a.pendingOrder) > len(a.pending)*2 {
+		kept := a.pendingOrder[:0]
+		for _, k := range a.pendingOrder {
+			if _, ok := a.pending[k]; ok {
+				kept = append(kept, k)
+			}
+		}
+		a.pendingOrder = kept
+	}
+	if len(a.cliCodeOrder) > len(a.cliCodes)*2 {
+		kept := a.cliCodeOrder[:0]
+		for _, k := range a.cliCodeOrder {
+			if _, ok := a.cliCodes[k]; ok {
+				kept = append(kept, k)
+			}
+		}
+		a.cliCodeOrder = kept
+	}
 }
 
 func random(n int) string {
@@ -129,7 +272,7 @@ func random(n int) string {
 
 func key(token string) string {
 	h := sha256.Sum256([]byte(token))
-	return string(h[:])
+	return hex.EncodeToString(h[:])
 }
 
 // Lookup returns the Web session for the request cookie.
@@ -138,13 +281,18 @@ func (a *Authenticator) Lookup(r *http.Request) (*WebSession, bool) {
 	if err != nil || c.Value == "" {
 		return nil, false
 	}
+	k := key(c.Value)
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	s, ok := a.sessions[key(c.Value)]
+	s, ok := a.sessions[k]
 	if !ok || time.Now().After(s.ExpiresAt) {
-		delete(a.sessions, key(c.Value))
+		delete(a.sessions, k)
+		a.mu.Unlock()
+		if ok && a.store != nil {
+			_ = a.store.DeleteWebSession(k)
+		}
 		return nil, false
 	}
+	a.mu.Unlock()
 	return s, true
 }
 
@@ -163,28 +311,31 @@ func Subject(u User, snap *authz.Snapshot) authz.Subject {
 
 func (a *Authenticator) startSession(w http.ResponseWriter, u User) {
 	tok := random(32)
-	now := time.Now()
+	k := key(tok)
+	now := time.Now().UTC()
 	s := &WebSession{User: u, CSRF: random(24), CreatedAt: now, ExpiresAt: now.Add(a.cfg.SessionTTL)}
+	var evicted []string
 	a.mu.Lock()
-	for k, v := range a.sessions {
-		if now.After(v.ExpiresAt) {
-			delete(a.sessions, k)
+	for len(a.sessions) >= maxWebSessions && len(a.sessionOrder) > 0 {
+		oldest := a.sessionOrder[0]
+		a.sessionOrder = a.sessionOrder[1:]
+		if _, exists := a.sessions[oldest]; exists {
+			delete(a.sessions, oldest)
+			evicted = append(evicted, oldest)
 		}
 	}
-	if len(a.sessions) >= maxWebSessions {
-		var oldestKey string
-		var oldestTime time.Time
-		for k, v := range a.sessions {
-			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
-				oldestKey, oldestTime = k, v.CreatedAt
-			}
-		}
-		if oldestKey != "" {
-			delete(a.sessions, oldestKey)
-		}
-	}
-	a.sessions[key(tok)] = s
+	a.sessions[k] = s
+	a.sessionOrder = append(a.sessionOrder, k)
 	a.mu.Unlock()
+
+	if a.store != nil {
+		for _, ek := range evicted {
+			_ = a.store.DeleteWebSession(ek)
+		}
+		if err := a.store.SaveWebSession(k, s); err != nil && a.log != nil {
+			a.log.Error("persist web session failed", "err", err)
+		}
+	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: tok, Path: "/", HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode, Expires: s.ExpiresAt})
 	a.audit.Record(audit.Event{Actor: "user:" + u.ID, User: u.DisplayName, Action: "web.login", Result: "ok", Extra: map[string]any{"issuer": u.Issuer}})
 }
@@ -198,26 +349,37 @@ func (a *Authenticator) RevokeUser(userID string) (webCount, cliCount int) {
 // RevokeMatching deletes every Web session and CLI token whose user satisfies
 // match, as well as any pending CLI authorization codes for those users.
 func (a *Authenticator) RevokeMatching(match func(authz.Subject) bool) (webCount, cliCount int) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	subj := func(u User) authz.Subject {
 		return authz.Subject{UserID: u.ID, Issuer: u.Issuer, Sub: u.Subject, Groups: u.Groups, Name: u.DisplayName}
 	}
+	var rmWeb, rmCLI []string
+	a.mu.Lock()
 	for k, s := range a.sessions {
 		if match(subj(s.User)) {
 			delete(a.sessions, k)
+			rmWeb = append(rmWeb, k)
 			webCount++
 		}
 	}
 	for k, c := range a.cliTokens {
 		if match(subj(c.User)) {
 			delete(a.cliTokens, k)
+			rmCLI = append(rmCLI, k)
 			cliCount++
 		}
 	}
 	for k, c := range a.cliCodes {
 		if match(subj(c.user)) {
 			delete(a.cliCodes, k)
+		}
+	}
+	a.mu.Unlock()
+	if a.store != nil {
+		for _, k := range rmWeb {
+			_ = a.store.DeleteWebSession(k)
+		}
+		for _, k := range rmCLI {
+			_ = a.store.DeleteCLIToken(k)
 		}
 	}
 	return webCount, cliCount
@@ -230,19 +392,24 @@ func (a *Authenticator) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state, nonce, verifier, binding := random(24), random(24), oauth2.GenerateVerifier(), random(24)
-	a.mu.Lock()
 	now := time.Now()
-	for k, p := range a.pending {
-		if now.After(p.expires) {
-			delete(a.pending, k)
+	a.mu.Lock()
+	// Opportunistically expire oldest pending logins only when nearing limit.
+	for len(a.pending) >= 10000 && len(a.pendingOrder) > 0 {
+		oldest := a.pendingOrder[0]
+		if p, ok := a.pending[oldest]; ok && !now.After(p.expires) {
+			break
 		}
+		a.pendingOrder = a.pendingOrder[1:]
+		delete(a.pending, oldest)
 	}
-	if len(a.pending) > 10000 {
+	if len(a.pending) >= 10000 {
 		a.mu.Unlock()
 		http.Error(w, "too many pending logins", http.StatusServiceUnavailable)
 		return
 	}
 	a.pending[state] = pendingLogin{nonce: nonce, verifier: verifier, browserBinding: binding, next: SafeNext(r.URL.Query().Get("next")), expires: now.Add(10 * time.Minute)}
+	a.pendingOrder = append(a.pendingOrder, state)
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: stateCookie, Value: binding, Path: "/auth/", HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
@@ -342,9 +509,13 @@ func (a *Authenticator) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c, err := r.Cookie(cookieName); err == nil {
+		k := key(c.Value)
 		a.mu.Lock()
-		delete(a.sessions, key(c.Value))
+		delete(a.sessions, k)
 		a.mu.Unlock()
+		if a.store != nil {
+			_ = a.store.DeleteWebSession(k)
+		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: a.cfg.SecureCookie})
 	w.WriteHeader(http.StatusNoContent)

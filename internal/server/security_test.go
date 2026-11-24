@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/indexyz/osmium/internal/protocol"
 	"github.com/indexyz/osmium/internal/server"
 	"github.com/indexyz/osmium/internal/sessions"
+	"github.com/indexyz/osmium/internal/storage"
 )
 
 const srvHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
@@ -405,5 +407,159 @@ func TestMaxPendingStreamsAndNativeReadLimit(t *testing.T) {
 			}
 			break
 		}
+	}
+}
+
+func TestPaginationIncrementalAdminCRUDAndSQLiteSessionPersistence(t *testing.T) {
+	f := newFixture(t, 4)
+	db, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	f.store.SetPersister(db)
+	if err := db.SaveDocument(f.store.Current().Document()); err != nil {
+		t.Fatal(err)
+	}
+	f.store.OnHostChange(func(snap *authz.Snapshot, agentIDs []string) {
+		for _, id := range agentIDs {
+			f.hub.ReconcileHost(snap, id)
+		}
+	})
+
+	aliceC, aliceCSRF, _ := f.login(t, "alice", "ops")
+	adminC, adminCSRF, _ := f.login(t, "root", "admins")
+
+	doReq := func(c *http.Client, method, path, csrf, body string) *http.Response {
+		req, _ := http.NewRequest(method, f.web.URL+path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if csrf != "" {
+			req.Header.Set("X-CSRF-Token", csrf)
+			req.Header.Set("Origin", f.web.URL)
+		}
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Non-admin and missing-CSRF admin writes must fail with 403.
+	if r := doReq(aliceC, http.MethodPut, "/api/v1/admin/host-cas", aliceCSRF, `{"host_ca_public_keys":["`+srvHostKey+`"]}`); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-admin host-cas: %d", r.StatusCode)
+	}
+	if r := doReq(adminC, http.MethodPut, "/api/v1/admin/host-cas", "", `{"host_ca_public_keys":["`+srvHostKey+`"]}`); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("no-csrf host-cas: %d", r.StatusCode)
+	}
+
+	// Admin installs Host CA, then adds two Host CA-only hosts incrementally.
+	if r := doReq(adminC, http.MethodPut, "/api/v1/admin/host-cas", adminCSRF, `{"host_ca_public_keys":["`+srvHostKey+`"]}`); r.StatusCode != http.StatusOK {
+		t.Fatalf("set host-cas: %d", r.StatusCode)
+	}
+	for _, spec := range []struct{ id, ag, env string }{
+		{"host-200", "agent-200", "prod"},
+		{"host-300", "agent-300", "dev"},
+	} {
+		body := `{"display_name":"` + spec.id + `","policy_labels":{"env":"` + spec.env + `"},"allowed_login_users":["ops"],"agent":{"id":"` + spec.ag + `","client_cert_cn":"` + spec.ag + `"}}`
+		if r := doReq(adminC, http.MethodPut, "/api/v1/admin/hosts/"+spec.id, adminCSRF, body); r.StatusCode != http.StatusOK {
+			t.Fatalf("upsert %s: %d", spec.id, r.StatusCode)
+		}
+	}
+	// Removing Host CA while CA-only hosts exist must fail closed (400).
+	if r := doReq(adminC, http.MethodPut, "/api/v1/admin/host-cas", adminCSRF, `{"host_ca_public_keys":[]}`); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("clearing host-cas with CA-only hosts: %d, want 400", r.StatusCode)
+	}
+	// Grant ops access to env=prod (covers host-200; host-123 already granted by g1).
+	if r := doReq(adminC, http.MethodPut, "/api/v1/admin/grants/g-prod", adminCSRF,
+		`{"subjects":[{"group":"ops"}],"hosts":{"labels":{"env":"prod"}},"logins":["ops"]}`); r.StatusCode != http.StatusOK {
+		t.Fatalf("upsert grant: %d", r.StatusCode)
+	}
+
+	// Verify cursor pagination + invalid parameter rejection on /api/v1/hosts.
+	type hostPage struct {
+		Items      []struct{ ID string } `json:"items"`
+		NextCursor string                `json:"next_cursor"`
+		Total      int                   `json:"total"`
+	}
+	getPage := func(q string) (hostPage, int) {
+		r, err := aliceC.Get(f.web.URL + "/api/v1/hosts" + q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		var p hostPage
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		return p, r.StatusCode
+	}
+	p1, code := getPage("?limit=1")
+	if code != http.StatusOK || p1.Total != 2 || len(p1.Items) != 1 || p1.Items[0].ID != "host-123" || p1.NextCursor == "" {
+		t.Fatalf("page 1: code=%d %+v", code, p1)
+	}
+	p2, code := getPage("?limit=1&cursor=" + p1.NextCursor)
+	if code != http.StatusOK || p2.Total != 2 || len(p2.Items) != 1 || p2.Items[0].ID != "host-200" || p2.NextCursor != "" {
+		t.Fatalf("page 2: code=%d %+v", code, p2)
+	}
+	// Negative query guards.
+	for _, bad := range []string{"?limit=0", "?limit=999", "?status=bogus", "?cursor=!!!"} {
+		if _, code := getPage(bad); code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", bad, code)
+		}
+	}
+
+	// Connect agent-200, then disable host-200 via incremental PUT -> agent must disconnect immediately.
+	leaf200, _ := f.pki.Issue("agent-200", nil, true)
+	ws200, _, err := websocket.Dial(context.Background(), "wss://"+f.agentSrv.Listener.Addr().String()+protocol.TunnelPath, &websocket.DialOptions{
+		HTTPClient:   &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{leaf200.TLS()}, RootCAs: f.pki.Pool()}}},
+		Subprotocols: []string{protocol.SubprotocolTunnel},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws200.CloseNow()
+	hello, _ := protocol.Encode(protocol.TypeHello, protocol.Hello{AgentVersion: "t", ReportedLabels: map[string]string{}})
+	_ = ws200.Write(context.Background(), websocket.MessageText, hello)
+	_, _, _ = ws200.Read(context.Background())
+
+	disableBody := `{"display_name":"host-200","policy_labels":{"env":"prod"},"allowed_login_users":["ops"],"disabled":true,"agent":{"id":"agent-200","client_cert_cn":"agent-200"}}`
+	if r := doReq(adminC, http.MethodPut, "/api/v1/admin/hosts/host-200", adminCSRF, disableBody); r.StatusCode != http.StatusOK {
+		t.Fatalf("disable host-200: %d", r.StatusCode)
+	}
+	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _, err = ws200.Read(rctx)
+	rcancel()
+	if err == nil {
+		t.Fatal("disabled host's agent stayed connected")
+	}
+
+	// Verify SQLite-backed Authenticator preserves Web session and CLI token across restarts.
+	authDB, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "auth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authDB.Close() })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a1, err := authn.New(context.Background(), authn.Config{DevLogin: true, Store: authDB}, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	reqLogin := httptest.NewRequest(http.MethodGet, "/auth/dev-login?user=persisted&group=ops", nil)
+	a1.HandleDevLogin(rec, reqLogin)
+	cookies := rec.Result().Cookies()
+	a1.Shutdown()
+
+	a2, err := authn.New(context.Background(), authn.Config{DevLogin: true, Store: authDB}, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Shutdown()
+	reqCheck := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	for _, ck := range cookies {
+		reqCheck.AddCookie(ck)
+	}
+	if ws, ok := a2.Lookup(reqCheck); !ok || ws.User.Subject != "persisted" {
+		t.Fatalf("web session did not survive SQLite restart: ok=%v ws=%+v", ok, ws)
 	}
 }

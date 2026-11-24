@@ -1,7 +1,8 @@
-// Package agent is the host Agent runtime: it registers over the control WSS
-// with its mTLS identity, opens the shared data WSS with the one-time ticket,
-// runs the smux server side and forwards each accepted stream to the locally
-// configured sshd only.
+// Package agent is the host Agent runtime: it maintains a single mTLS
+// WebSocket (/agent/v1/tunnel) to the Server, keeps it alive via WebSocket
+// Ping/Pong when idle, activates smux v2 on demand when the Server sends
+// mux.open, hibernates smux on mux.close, and forwards each accepted stream
+// strictly to the locally configured loopback sshd.
 package agent
 
 import (
@@ -14,9 +15,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/xtaci/smux"
 
 	"github.com/indexyz/osmium/internal/protocol"
 	"github.com/indexyz/osmium/internal/tunnel"
@@ -24,20 +27,21 @@ import (
 
 // Options configures the Agent.
 type Options struct {
-	ServerURL    string // wss://server:8443 (no path)
-	TLS          *tls.Config
-	SSHTarget    string
-	Labels       map[string]string
-	Version      string
-	MaxStreams   int
-	Heartbeat    time.Duration
-	StreamOpen   time.Duration
-	TCPDial      time.Duration
-	RelayDrain   time.Duration
-	ReconnectMax time.Duration
-	Mux          tunnel.MuxConfig
-	Log          *slog.Logger
-	// OnReady is called (if set) when an epoch's data tunnel is ready.
+	ServerURL       string // wss://server:8443 (no path)
+	TLS             *tls.Config
+	SSHTarget       string
+	Labels          map[string]string
+	Version         string
+	MaxStreams      int
+	Heartbeat       time.Duration // fallback ping interval when server does not dictate one
+	StreamOpen      time.Duration
+	TCPDial         time.Duration
+	RelayDrain      time.Duration
+	ReconnectJitter time.Duration // uniform jitter after healthy epoch ends (anti-thundering-herd); negative disables jitter
+	ReconnectMax    time.Duration
+	Mux             tunnel.MuxConfig
+	Log             *slog.Logger
+	// OnReady is called (if set) when an epoch finishes registration.
 	OnReady func(epoch uint64)
 }
 
@@ -53,7 +57,7 @@ func (o *Options) defaults() error {
 		o.MaxStreams = 32
 	}
 	if o.Heartbeat <= 0 {
-		o.Heartbeat = 10 * time.Second
+		o.Heartbeat = 45 * time.Second
 	}
 	if o.StreamOpen <= 0 {
 		o.StreamOpen = 10 * time.Second
@@ -63,6 +67,9 @@ func (o *Options) defaults() error {
 	}
 	if o.RelayDrain <= 0 {
 		o.RelayDrain = 5 * time.Second
+	}
+	if o.ReconnectJitter == 0 {
+		o.ReconnectJitter = 30 * time.Second
 	}
 	if o.ReconnectMax <= 0 {
 		o.ReconnectMax = time.Minute
@@ -79,77 +86,90 @@ func (o *Options) defaults() error {
 	return nil
 }
 
-// Run keeps the Agent registered until ctx ends, reconnecting with jittered
-// exponential backoff. Every reconnect is a new epoch; old streams are never
-// migrated.
+// Run keeps the Agent registered until ctx ends, reconnecting with anti-herd
+// random jitter and exponential backoff. Every reconnect is a new epoch; old
+// streams are never migrated.
 func Run(ctx context.Context, o Options) error {
 	if err := o.defaults(); err != nil {
 		return err
 	}
+	tr := &http.Transport{TLSClientConfig: o.TLS, Proxy: http.ProxyFromEnvironment}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{
+		Transport: tr,
+		// Never follow redirects: prevents credential/redirect abuse.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
 	backoff := time.Second
 	for {
 		start := time.Now()
-		err := runEpoch(ctx, o)
+		err := runEpoch(ctx, client, o)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		var wait time.Duration
 		if time.Since(start) > 2*time.Minute {
 			backoff = time.Second
+			if o.ReconnectJitter > 0 {
+				// Spread 50k+ fleet reconnects evenly over [0, ReconnectJitter]
+				// after a server restart or network flap.
+				wait = rand.N(o.ReconnectJitter + 1)
+			} else {
+				wait = backoff/2 + rand.N(backoff/2+1)
+			}
+		} else {
+			wait = backoff/2 + rand.N(backoff/2+1)
+			backoff = min(backoff*2, o.ReconnectMax)
 		}
-		wait := backoff/2 + rand.N(backoff/2+1)
 		o.Log.Warn("agent epoch ended; reconnecting", "err", err, "in", wait)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(wait):
 		}
-		backoff = min(backoff*2, o.ReconnectMax)
 	}
 }
 
-func (o *Options) httpClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{TLSClientConfig: o.TLS, Proxy: http.ProxyFromEnvironment},
-		// Never follow redirects: they could leak the data ticket elsewhere.
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+type agentMux struct {
+	gen           uint32
+	mux           *smux.Session
+	expectedClose atomic.Bool
 }
 
-func send(ctx context.Context, ws *websocket.Conn, mu *sync.Mutex, typ string, payload any) error {
-	b, err := protocol.Encode(typ, payload)
-	if err != nil {
-		return err
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return ws.Write(ctx, websocket.MessageText, b)
-}
-
-func runEpoch(parent context.Context, o Options) error {
+func runEpoch(parent context.Context, client *http.Client, o Options) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	client := o.httpClient()
+
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
-	ctrl, _, err := websocket.Dial(dialCtx, o.ServerURL+protocol.ControlPath, &websocket.DialOptions{
-		HTTPClient: client, Subprotocols: []string{protocol.SubprotocolControl}, CompressionMode: websocket.CompressionDisabled,
+	ws, _, err := websocket.Dial(dialCtx, o.ServerURL+protocol.TunnelPath, &websocket.DialOptions{
+		HTTPClient:      client,
+		Subprotocols:    []string{protocol.SubprotocolTunnel},
+		CompressionMode: websocket.CompressionDisabled,
 	})
 	dialCancel()
 	if err != nil {
-		return fmt.Errorf("control dial: %w", err)
+		return fmt.Errorf("tunnel dial: %w", err)
 	}
-	defer ctrl.CloseNow()
-	if ctrl.Subprotocol() != protocol.SubprotocolControl {
-		return errors.New("server did not accept control subprotocol")
+	defer ws.CloseNow()
+	if ws.Subprotocol() != protocol.SubprotocolTunnel {
+		return errors.New("server did not accept tunnel subprotocol")
 	}
-	ctrl.SetReadLimit(protocol.MaxControlMessage)
-	var wmu sync.Mutex
-	if err := send(ctx, ctrl, &wmu, protocol.TypeHello, protocol.Hello{AgentVersion: o.Version, ReportedLabels: o.Labels}); err != nil {
+	ws.SetReadLimit(protocol.MaxControlMessage)
+
+	helloBytes, err := protocol.Encode(protocol.TypeHello, protocol.Hello{AgentVersion: o.Version, ReportedLabels: o.Labels})
+	if err != nil {
+		return fmt.Errorf("encode hello: %w", err)
+	}
+	hctx, hcancel := context.WithTimeout(ctx, 15*time.Second)
+	err = ws.Write(hctx, websocket.MessageText, helloBytes)
+	hcancel()
+	if err != nil {
 		return fmt.Errorf("hello: %w", err)
 	}
+
 	wctx, wcancel := context.WithTimeout(ctx, 15*time.Second)
-	typ, data, err := ctrl.Read(wctx)
+	typ, data, err := ws.Read(wctx)
 	wcancel()
 	if err != nil || typ != websocket.MessageText {
 		return fmt.Errorf("welcome: %w", err)
@@ -161,32 +181,33 @@ func runEpoch(parent context.Context, o Options) error {
 	w := payload.(*protocol.Welcome)
 	log := o.Log.With("host_id", w.HostID, "epoch", w.Epoch)
 
-	// The data path is a fixed constant validated by protocol.Decode; it is
-	// resolved against the configured server only.
-	dctx, dcancel := context.WithTimeout(ctx, 15*time.Second)
-	dataWS, _, err := websocket.Dial(dctx, o.ServerURL+w.DataPath, &websocket.DialOptions{
-		HTTPClient: client, Subprotocols: []string{protocol.SubprotocolData}, CompressionMode: websocket.CompressionDisabled,
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + w.DataTicket}},
-	})
-	dcancel()
-	if err != nil {
-		return fmt.Errorf("data dial: %w", err)
-	}
-	if dataWS.Subprotocol() != protocol.SubprotocolData {
-		dataWS.CloseNow()
-		return errors.New("server did not accept data subprotocol")
-	}
-	mux, err := tunnel.NewAgentMux(ctx, dataWS, o.Mux)
-	if err != nil {
-		dataWS.CloseNow()
-		return fmt.Errorf("smux: %w", err)
-	}
-	defer mux.Close()
+	demux := tunnel.NewDemux(ctx, ws, protocol.MaxControlMessage, protocol.MaxBinaryMessage)
+	defer demux.Close()
+
 	reg := tunnel.NewRegistry(o.MaxStreams)
-	var handlers sync.WaitGroup
+	binding := tunnel.Binding{HostID: w.HostID, Epoch: w.Epoch}
+	rejectSem := make(chan struct{}, 8)
+
+	var (
+		muxMu    sync.Mutex
+		curMux   *agentMux
+		handlers sync.WaitGroup
+	)
+	closeCurrentMux := func() {
+		muxMu.Lock()
+		am := curMux
+		curMux = nil
+		muxMu.Unlock()
+		if am != nil {
+			am.expectedClose.Store(true)
+			_ = am.mux.Close()
+			demux.Deactivate(am.gen)
+		}
+	}
 	defer func() {
+		cancel()
 		reg.CloseAll()
-		_ = mux.Close()
+		closeCurrentMux()
 		done := make(chan struct{})
 		go func() { handlers.Wait(); close(done) }()
 		select {
@@ -195,91 +216,163 @@ func runEpoch(parent context.Context, o Options) error {
 			log.Warn("stream handlers still draining after epoch end")
 		}
 	}()
-	binding := tunnel.Binding{HostID: w.HostID, Epoch: w.Epoch}
-	rejectSem := make(chan struct{}, 8)
+
+	// Keepalive via WebSocket native Ping/Pong (zero JSON traffic when idle).
+	pingInterval := time.Duration(w.PingIntervalMs) * time.Millisecond
+	if pingInterval <= 0 {
+		pingInterval = o.Heartbeat
+	}
+	pingTimeout := time.Duration(w.PingTimeoutMs) * time.Millisecond
+	if pingTimeout <= pingInterval {
+		pingTimeout = pingInterval * 2
+	}
 	go func() {
-		defer cancel()
+		// Add small jitter so pings across 50k agents stay desynchronized.
 		for {
-			st, err := mux.AcceptStream()
-			if err != nil {
-				log.Warn("data tunnel ended", "err", err)
-				return
+			jitter := time.Duration(0)
+			if j := pingInterval / 5; j > 0 {
+				jitter = rand.N(j) - j/2
 			}
-			if !reg.Reserve() {
-				select {
-				case rejectSem <- struct{}{}:
-					handlers.Add(1)
-					go func() {
-						defer handlers.Done()
-						defer func() { <-rejectSem }()
-						tunnel.RejectStream(st, tunnel.CodeTooManyStreams, 2*time.Second)
-					}()
-				default:
-					_ = st.Close()
-				}
-				continue
-			}
-			handlers.Add(1)
-			go func() {
-				defer handlers.Done()
-				defer reg.Unreserve()
-				err := tunnel.ServeSSHStream(ctx, st, tunnel.AgentOptions{
-					Binding: binding, Target: o.SSHTarget, OpenTimeout: o.StreamOpen, DialTimeout: o.TCPDial, DrainTimeout: o.RelayDrain, Registry: reg,
-				})
-				if err != nil {
-					log.Debug("stream ended", "code", tunnel.ErrorCode(err), "err", err)
-				}
-			}()
-		}
-	}()
-	go func() {
-		t := time.NewTicker(o.Heartbeat)
-		defer t.Stop()
-		for {
+			timer := time.NewTimer(pingInterval + jitter)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-t.C:
-				hb := protocol.Heartbeat{Epoch: w.Epoch, DataTunnelID: w.DataTunnelID, DataConnected: !mux.IsClosed(), ActiveStreams: reg.Active()}
-				if err := send(ctx, ctrl, &wmu, protocol.TypeHeartbeat, hb); err != nil {
-					cancel()
-					return
-				}
+			case <-timer.C:
+			}
+			pctx, pcancel := context.WithTimeout(ctx, min(pingTimeout/2, 15*time.Second))
+			err := ws.Ping(pctx)
+			pcancel()
+			if err != nil {
+				log.Warn("tunnel ping failed", "err", err)
+				cancel()
+				return
 			}
 		}
 	}()
-	for {
-		typ, data, err := ctrl.Read(ctx)
-		if err != nil {
-			return fmt.Errorf("control: %w", err)
-		}
-		if typ != websocket.MessageText {
-			return errors.New("control: binary message")
-		}
-		mt, payload, err := protocol.Decode(data)
+
+	log.Info("agent tunnel ready")
+	if o.OnReady != nil {
+		o.OnReady(w.Epoch)
+	}
+
+	return demux.Run(func(msg []byte) error {
+		mt, payload, err := protocol.Decode(msg)
 		if err != nil {
 			return fmt.Errorf("control: %w", err)
 		}
 		switch v := payload.(type) {
-		case *protocol.DataReady:
-			if v.Epoch != w.Epoch || v.DataTunnelID != w.DataTunnelID {
-				return errors.New("control: data_ready for another epoch")
+		case *protocol.MuxOpen:
+			if v.Epoch != w.Epoch {
+				return fmt.Errorf("control: mux.open for wrong epoch %d", v.Epoch)
 			}
-			log.Info("data tunnel ready")
-			if o.OnReady != nil {
-				o.OnReady(w.Epoch)
+			smuxCfg := tunnel.MuxConfig{
+				MaxFrameSize:      v.Smux.MaxFrameSize,
+				MaxReceiveBuffer:  v.Smux.MaxReceiveBuffer,
+				MaxStreamBuffer:   v.Smux.MaxStreamBuffer,
+				KeepAliveInterval: time.Duration(v.Smux.KeepAliveIntervalMs) * time.Millisecond,
+				KeepAliveTimeout:  time.Duration(v.Smux.KeepAliveTimeoutMs) * time.Millisecond,
 			}
+			closeCurrentMux()
+			pipeBuf := min(smuxCfg.MaxReceiveBuffer, 256*1024)
+			// Must activate synchronously inside the read loop so the very next
+			// binary frame carrying mux_gen=v.MuxGen is routed immediately.
+			gc, err := demux.Activate(v.MuxGen, pipeBuf)
+			if err != nil {
+				return fmt.Errorf("control: activate mux gen %d: %w", v.MuxGen, err)
+			}
+			mux, err := tunnel.NewAgentMuxConn(gc, smuxCfg)
+			if err != nil {
+				demux.Deactivate(v.MuxGen)
+				return fmt.Errorf("control: start smux gen %d: %w", v.MuxGen, err)
+			}
+			am := &agentMux{gen: v.MuxGen, mux: mux}
+			muxMu.Lock()
+			curMux = am
+			muxMu.Unlock()
+			handlers.Add(1)
+			go func(am *agentMux) {
+				defer handlers.Done()
+				for {
+					st, err := am.mux.AcceptStream()
+					if err != nil {
+						if !am.expectedClose.Load() && ctx.Err() == nil {
+							log.Warn("smux generation ended unexpectedly", "gen", am.gen, "err", err)
+							cancel()
+						}
+						return
+					}
+					if !reg.Reserve() {
+						select {
+						case rejectSem <- struct{}{}:
+							handlers.Add(1)
+							go func() {
+								defer handlers.Done()
+								defer func() { <-rejectSem }()
+								tunnel.RejectStream(st, tunnel.CodeTooManyStreams, 2*time.Second)
+							}()
+						default:
+							_ = st.Close()
+						}
+						continue
+					}
+					handlers.Add(1)
+					go func() {
+						defer handlers.Done()
+						defer reg.Unreserve()
+						err := tunnel.ServeSSHStream(ctx, st, tunnel.AgentOptions{
+							Binding: binding, Target: o.SSHTarget, OpenTimeout: o.StreamOpen, DialTimeout: o.TCPDial, DrainTimeout: o.RelayDrain, Registry: reg,
+						})
+						if err != nil {
+							log.Debug("stream ended", "code", tunnel.ErrorCode(err), "err", err)
+						}
+					}()
+				}
+			}(am)
+			return nil
+
+		case *protocol.MuxClose:
+			if v.Epoch != w.Epoch {
+				return nil
+			}
+			muxMu.Lock()
+			var target *agentMux
+			if curMux != nil && curMux.gen == v.MuxGen {
+				target = curMux
+				curMux = nil
+			}
+			muxMu.Unlock()
+			if target != nil {
+				target.expectedClose.Store(true)
+				_ = target.mux.Close()
+				demux.Deactivate(target.gen)
+			}
+			return nil
+
 		case *protocol.SessionClose:
 			if mt != protocol.TypeClose {
 				return errors.New("control: unexpected session.closed from server")
 			}
 			if v.Epoch != w.Epoch {
-				continue // stale epoch command: never touches this epoch
+				return nil // stale epoch command: never touches this epoch
 			}
 			reg.Close(v.SessionID, v.AttemptID)
-			_ = send(ctx, ctrl, &wmu, protocol.TypeClosed, protocol.SessionClose{Epoch: w.Epoch, SessionID: v.SessionID, AttemptID: v.AttemptID, Reason: v.Reason})
+			// Send the receipt asynchronously so the read loop can never block
+			// waiting on writeMu while TCP backpressure builds up.
+			receipt, err := protocol.Encode(protocol.TypeClosed, protocol.SessionClose{
+				Epoch: w.Epoch, SessionID: v.SessionID, AttemptID: v.AttemptID, Reason: v.Reason,
+			})
+			if err == nil {
+				go func() {
+					sctx, scancel := context.WithTimeout(ctx, 5*time.Second)
+					defer scancel()
+					_ = demux.SendText(sctx, receipt)
+				}()
+			}
+			return nil
+
 		default:
 			return fmt.Errorf("control: unexpected %s", mt)
 		}
-	}
+	}, nil)
 }

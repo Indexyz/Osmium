@@ -94,6 +94,9 @@ func newLogoutCmd() *cobra.Command {
 
 func newHostsCmd() *cobra.Command {
 	var labels []string
+	var query, status string
+	var limit int
+	var all bool
 	c := &cobra.Command{
 		Use:   "hosts",
 		Short: "列出有权访问的主机",
@@ -103,9 +106,35 @@ func newHostsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			hosts, err := api.Hosts(cmd.Context(), labels)
-			if err != nil {
-				return err
+			var hosts []client.Host
+			var total int
+			var hasMore bool
+			if all {
+				cursor := ""
+				for {
+					page, err := api.HostsPage(cmd.Context(), client.HostPageQuery{
+						Labels: labels, Query: query, Status: status, Cursor: cursor, Limit: 500,
+					})
+					if err != nil {
+						return err
+					}
+					total = page.Total
+					hosts = append(hosts, page.Items...)
+					if page.NextCursor == "" || len(page.Items) == 0 {
+						break
+					}
+					cursor = page.NextCursor
+				}
+			} else {
+				page, err := api.HostsPage(cmd.Context(), client.HostPageQuery{
+					Labels: labels, Query: query, Status: status, Limit: limit,
+				})
+				if err != nil {
+					return err
+				}
+				hosts = page.Items
+				total = page.Total
+				hasMore = page.NextCursor != ""
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 			fmt.Fprintln(tw, "ID\tNAME\tSTATUS\tLOGINS\tLABELS")
@@ -117,10 +146,20 @@ func newHostsCmd() *cobra.Command {
 				sort.Strings(ls)
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.ID, h.DisplayName, h.Status, strings.Join(h.AllowedLoginUsers, ","), strings.Join(ls, ","))
 			}
-			return tw.Flush()
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+			if hasMore {
+				fmt.Fprintf(cmd.ErrOrStderr(), "显示前 %d / %d 台主机；使用 -q/-l/--status 缩小范围或 --all 导出全部\n", len(hosts), total)
+			}
+			return nil
 		},
 	}
 	c.Flags().StringArrayVarP(&labels, "label", "l", nil, "按策略标签筛选，key=value，可重复（AND）")
+	c.Flags().StringVarP(&query, "query", "q", "", "按主机 ID 或名称关键字过滤")
+	c.Flags().StringVar(&status, "status", "", "按状态筛选（ready|offline|disabled）")
+	c.Flags().IntVar(&limit, "limit", 100, "单页返回数量（1–500）")
+	c.Flags().BoolVar(&all, "all", false, "自动翻页获取全部匹配主机")
 	return c
 }
 

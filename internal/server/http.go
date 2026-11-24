@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,11 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/cli-tokens", s.authed(s.adminListCLITokens))
 	mux.HandleFunc("POST /api/v1/admin/cli-tokens/{token_id}/revoke", s.authed(s.csrf(s.adminRevokeCLIToken)))
 	mux.HandleFunc("POST /api/v1/admin/users/{user_id}/revoke", s.authed(s.csrf(s.adminRevokeUser)))
+	mux.HandleFunc("PUT /api/v1/admin/hosts/{host_id}", s.authed(s.csrf(s.adminUpsertHost)))
+	mux.HandleFunc("DELETE /api/v1/admin/hosts/{host_id}", s.authed(s.csrf(s.adminDeleteHost)))
+	mux.HandleFunc("PUT /api/v1/admin/grants/{grant_id}", s.authed(s.csrf(s.adminUpsertGrant)))
+	mux.HandleFunc("DELETE /api/v1/admin/grants/{grant_id}", s.authed(s.csrf(s.adminDeleteGrant)))
+	mux.HandleFunc("PUT /api/v1/admin/host-cas", s.authed(s.csrf(s.adminSetHostCAs)))
 	return securityHeaders(mux)
 }
 
@@ -77,8 +83,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 // AgentHandler returns the handler for the mTLS Agent listener.
 func (s *Server) AgentHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+protocol.ControlPath, s.Hub.HandleControl)
-	mux.HandleFunc("GET "+protocol.DataPath, s.Hub.HandleData)
+	mux.HandleFunc("GET "+protocol.TunnelPath, s.Hub.HandleTunnel)
 	return mux
 }
 
@@ -228,29 +233,90 @@ func parseLabelFilter(vals []string) (map[string]string, bool) {
 	return f, true
 }
 
+func decodeOpaqueCursor(raw string) (string, bool) {
+	if raw == "" {
+		return "", true
+	}
+	if len(raw) > 256 {
+		return "", false
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || len(b) == 0 || len(b) > 128 {
+		return "", false
+	}
+	id := string(b)
+	if !authz.ValidID(id) {
+		return "", false
+	}
+	return id, true
+}
+
+func encodeOpaqueCursor(id string) string {
+	if id == "" {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(id))
+}
+
 func (s *Server) listHosts(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
-	filter, ok := parseLabelFilter(r.URL.Query()["label"])
+	q := r.URL.Query()
+	filter, ok := parseLabelFilter(q["label"])
 	if !ok {
 		writeError(w, r, http.StatusBadRequest, "INVALID_FILTER", "label filter must be key=value")
 		return
 	}
-	snap := s.Store.Current()
-	items := []hostView{}
-	// Authorize first, then filter: the filter never widens visibility.
-	for _, h := range snap.VisibleHosts(rc.subject) {
-		match := true
-		for k, v := range filter {
-			if h.PolicyLabels[k] != v {
-				match = false
-				break
-			}
-		}
-		if !match {
-			continue
-		}
-		items = append(items, hostView{ID: h.ID, DisplayName: h.DisplayName, Status: s.Hub.Status(h), PolicyLabels: h.PolicyLabels, AllowedLoginUsers: snap.AllowedLogins(rc.subject, h)})
+	statusFilter := strings.TrimSpace(q.Get("status"))
+	switch statusFilter {
+	case "", "ready", "offline", "disabled":
+	default:
+		writeError(w, r, http.StatusBadRequest, "INVALID_FILTER", "status must be ready, offline or disabled")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	limit := 50
+	if rawLim := q.Get("limit"); rawLim != "" {
+		n, err := strconv.Atoi(rawLim)
+		if err != nil || n < 1 || n > 500 {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "limit must be 1..500")
+			return
+		}
+		limit = n
+	}
+	cursorID, ok := decodeOpaqueCursor(q.Get("cursor"))
+	if !ok {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid cursor")
+		return
+	}
+	searchQ := q.Get("q")
+	if len(searchQ) > 128 {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "query too long")
+		return
+	}
+
+	snap := s.Store.Current()
+	page := snap.VisibleHostsPage(rc.subject, authz.HostPageQuery{
+		Labels: filter,
+		Query:  searchQ,
+		Status: statusFilter,
+		Cursor: cursorID,
+		Limit:  limit,
+	}, s.Hub.Status)
+
+	items := make([]hostView, 0, len(page.Items))
+	for _, entry := range page.Items {
+		h := entry.Host
+		items = append(items, hostView{
+			ID:                h.ID,
+			DisplayName:       h.DisplayName,
+			Status:            entry.Status,
+			PolicyLabels:      h.PolicyLabels,
+			AllowedLoginUsers: entry.AllowedLogins,
+		})
+	}
+	out := map[string]any{"items": items, "total": page.Total}
+	if page.NextCursor != "" {
+		out["next_cursor"] = encodeOpaqueCursor(page.NextCursor)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type createBody struct {
@@ -345,7 +411,185 @@ func (s *Server) adminAgents(w http.ResponseWriter, r *http.Request, rc *reqCtx)
 		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": s.Hub.Agents()})
+	q := r.URL.Query()
+	limit := 100
+	if rawLim := q.Get("limit"); rawLim != "" {
+		n, err := strconv.Atoi(rawLim)
+		if err != nil || n < 1 || n > 1000 {
+			writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "limit must be 1..1000")
+			return
+		}
+		limit = n
+	}
+	cursorID, ok := decodeOpaqueCursor(q.Get("cursor"))
+	if !ok {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid cursor")
+		return
+	}
+	searchQ := q.Get("q")
+	if len(searchQ) > 128 {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "query too long")
+		return
+	}
+	page := s.Hub.AgentsPage(agenthub.AgentsPageQuery{
+		Query:  searchQ,
+		Cursor: cursorID,
+		Limit:  limit,
+	})
+	out := map[string]any{"items": page.Items, "total": page.Total}
+	if page.NextCursor != "" {
+		out["next_cursor"] = encodeOpaqueCursor(page.NextCursor)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) adminUpsertHost(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	hostID := r.PathValue("host_id")
+	if !authz.ValidID(hostID) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid host id")
+		return
+	}
+	var host authz.Host
+	d := json.NewDecoder(io.LimitReader(r.Body, 64*1024))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&host); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid host payload")
+		return
+	}
+	if host.ID != "" && host.ID != hostID {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "host id in body does not match path")
+		return
+	}
+	host.ID = hostID
+	snap, err := s.Store.UpsertHost(&host)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	saved, _ := snap.Host(hostID)
+	s.Audit.Record(audit.Event{
+		Actor: "user:" + rc.subject.UserID, User: rc.subject.Name,
+		Action: "admin.host_upsert", Result: "ok", Target: hostID, Revision: snap.Revision,
+		Extra: map[string]any{"agent_id": saved.Agent.ID, "disabled": saved.Disabled},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"host": saved, "policy_revision": snap.Revision})
+}
+
+func (s *Server) adminDeleteHost(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	hostID := r.PathValue("host_id")
+	if !authz.ValidID(hostID) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid host id")
+		return
+	}
+	snap, deleted, err := s.Store.DeleteHost(hostID)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "failed to delete host")
+		return
+	}
+	if !deleted {
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "host not found")
+		return
+	}
+	s.Audit.Record(audit.Event{
+		Actor: "user:" + rc.subject.UserID, User: rc.subject.Name,
+		Action: "admin.host_delete", Result: "ok", Target: hostID, Revision: snap.Revision,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": hostID, "policy_revision": snap.Revision})
+}
+
+func (s *Server) adminUpsertGrant(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	grantID := r.PathValue("grant_id")
+	if !authz.ValidID(grantID) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid grant id")
+		return
+	}
+	var g authz.Grant
+	d := json.NewDecoder(io.LimitReader(r.Body, 64*1024))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&g); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid grant payload")
+		return
+	}
+	if g.ID != "" && g.ID != grantID {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "grant id in body does not match path")
+		return
+	}
+	g.ID = grantID
+	snap, err := s.Store.UpsertGrant(g)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	s.Audit.Record(audit.Event{
+		Actor: "user:" + rc.subject.UserID, User: rc.subject.Name,
+		Action: "admin.grant_upsert", Result: "ok", Target: grantID, Revision: snap.Revision,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"grant": g, "policy_revision": snap.Revision})
+}
+
+func (s *Server) adminDeleteGrant(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	grantID := r.PathValue("grant_id")
+	if !authz.ValidID(grantID) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid grant id")
+		return
+	}
+	snap, deleted, err := s.Store.DeleteGrant(grantID)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "INTERNAL", "failed to delete grant")
+		return
+	}
+	if !deleted {
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "grant not found")
+		return
+	}
+	s.Audit.Record(audit.Event{
+		Actor: "user:" + rc.subject.UserID, User: rc.subject.Name,
+		Action: "admin.grant_delete", Result: "ok", Target: grantID, Revision: snap.Revision,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": grantID, "policy_revision": snap.Revision})
+}
+
+func (s *Server) adminSetHostCAs(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	if !rc.subject.IsAdmin {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "admin only")
+		return
+	}
+	var body struct {
+		HostCAPublicKeys []string `json:"host_ca_public_keys"`
+	}
+	d := json.NewDecoder(io.LimitReader(r.Body, 64*1024))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&body); err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "invalid body")
+		return
+	}
+	snap, err := s.Store.SetHostCAs(body.HostCAPublicKeys)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	s.Audit.Record(audit.Event{
+		Actor: "user:" + rc.subject.UserID, User: rc.subject.Name,
+		Action: "admin.host_cas_update", Result: "ok", Revision: snap.Revision,
+		Extra: map[string]any{"count": len(body.HostCAPublicKeys)},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"host_ca_public_keys": snap.HostCAPublicKeys(), "policy_revision": snap.Revision})
 }
 
 func (s *Server) adminListCLITokens(w http.ResponseWriter, r *http.Request, rc *reqCtx) {

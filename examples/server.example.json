@@ -3,6 +3,7 @@
   "listen": "127.0.0.1:8080",
   "public_url": "https://ssh.example.com",
   "policy_file": "/etc/osmium/policy.json",
+  "state_db": "/var/lib/osmium/osmium.db",
 
   "agent_listen": ":8443",
   "agent_tls_cert": "/etc/osmium/pki/server.crt",
@@ -49,9 +50,12 @@
     "revoke_active": true
   },
 
-  "tunnel_ticket_ttl": "30s",
-  "heartbeat_timeout": "45s",
+  "ping_interval": "45s",
+  "heartbeat_timeout": "135s",
+  "mux_idle_ttl": "60s",
   "stream_open_timeout": "10s",
   "max_streams_per_agent": 32,
-  "max_pending_streams_per_agent": 8
+  "max_pending_streams_per_agent": 8,
+  "agent_accept_rate": 4000,
+  "agent_accept_burst": 8000
 }
