@@ -451,7 +451,7 @@ func (m *Manager) precheckAdmit(u authz.Subject, hostID, login, mode string) (au
 		return d, ErrForbidden
 	}
 	host, _ := snap.Host(hostID)
-	if m.hub.Status(host) != "ready" {
+	if host == nil || !host.AllowsTunnel() || m.hub.Status(host) != "ready" {
 		return d, ErrUnavailable
 	}
 	return d, nil
@@ -687,7 +687,9 @@ func (m *Manager) onPolicyChange(snap *authz.Snapshot) {
 			continue
 		}
 		if d := snap.Check(s.Subject, s.HostID, s.Login); d.Allowed {
-			continue
+			if host, ok := snap.Host(s.HostID); ok && host.AllowsTunnel() {
+				continue
+			}
 		}
 		if st == StateActive && !m.cfg.RevokeActive {
 			continue
@@ -762,7 +764,7 @@ func (m *Manager) recheck(s *Session, phase string) (*authz.Snapshot, *authz.Hos
 		return nil, nil, false
 	}
 	host, ok := snap.Host(s.HostID)
-	if !ok {
+	if !ok || !host.AllowsTunnel() {
 		return nil, nil, false
 	}
 	s.mu.Lock()

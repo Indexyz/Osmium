@@ -39,6 +39,19 @@
     "required_source_address": ""
   },
 
+  "direct_ca": {
+    "provisioner_name": "direct-ssh",
+    "jwk_file": "/etc/osmium/direct-provisioner.jwk",
+    "jwk_password_file": "/etc/osmium/direct-provisioner.password",
+    "default_host_ttl": "60s",
+    "default_role_ttl": "4h",
+    "max_role_ttl": "8h",
+    "allowed_extensions": ["permit-pty", "permit-user-rc", "permit-port-forwarding"],
+    "source_address_mode": "none",
+    "source_address_cidrs": "",
+    "trusted_proxies": []
+  },
+
   "sessions": {
     "attach_timeout": "60s",
     "ssh_handshake": "15s",

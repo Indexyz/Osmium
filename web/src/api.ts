@@ -12,11 +12,15 @@ export interface MeResponse {
   csrf_token?: string;
 }
 
-export type HostStatus = "ready" | "connecting" | "offline" | "disabled";
+export type HostStatus = "ready" | "direct" | "connecting" | "offline" | "disabled";
+
+export type HostConnectionMode = "tunnel" | "direct" | "both";
 
 export interface HostItem {
   id: string;
   display_name: string;
+  connection_mode?: HostConnectionMode;
+  ssh_address?: string;
   status: HostStatus;
   policy_labels: Record<string, string>;
   allowed_login_users: string[];

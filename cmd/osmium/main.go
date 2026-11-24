@@ -27,7 +27,8 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.AddCommand(newServerCmd(), newAgentCmd(), newDevCmd(),
-		newLoginCmd(), newLogoutCmd(), newHostsCmd(), newSSHCmd(), newProxyConnectCmd(), &cobra.Command{
+		newLoginCmd(), newLogoutCmd(), newHostsCmd(), newSSHCmd(),
+		newCertCmd(), newSSHConfigCmd(), newSSHAgentCmd(), newProxyConnectCmd(), &cobra.Command{
 			Use:   "version",
 			Short: "打印版本",
 			Args:  cobra.NoArgs,

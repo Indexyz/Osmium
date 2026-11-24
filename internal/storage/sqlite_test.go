@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	_ "modernc.org/sqlite"
 
 	"github.com/indexyz/osmium/internal/audit"
 	"github.com/indexyz/osmium/internal/authn"
@@ -194,5 +196,132 @@ func TestSQLiteAuthPersistenceAndAuditIndexSearch(t *testing.T) {
 		From: now, To: now.Add(time.Minute), Limit: 10, Cursor: "invalid!!!",
 	}); !errors.Is(err, audit.ErrBadQuery) {
 		t.Fatalf("expected ErrBadQuery for bad cursor, got %v", err)
+	}
+}
+
+func TestSQLiteDirectHostsAndCertRolesPersistence(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "direct.db")
+	db, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostCA := genPubLine(t)
+	snap, err := authz.Build(authz.Document{
+		Scope:            "prod",
+		HostCAPublicKeys: []string{hostCA},
+		Hosts: []*authz.Host{
+			{ID: "direct-1", DisplayName: "db-1", ConnectionMode: authz.ConnModeDirect, SSHAddress: "10.0.1.10:22", AllowedLoginUsers: []string{"ops"}},
+			{ID: "direct-2", DisplayName: "db-2", ConnectionMode: authz.ConnModeDirect, SSHAddress: "10.0.1.11:2222", AllowedLoginUsers: []string{"ops"}},
+		},
+		CertRoles: []authz.CertRole{
+			{ID: "r-init", Subjects: []authz.SubjectSelector{{Group: "ops"}}, Principals: []string{"role:ops"}, MaxTTL: "4h"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := authz.NewStore(snap)
+	store.SetPersister(db)
+	if err := db.SaveDocument(snap.Document()); err != nil {
+		t.Fatal(err)
+	}
+	// Incremental upsert + delete on direct host & cert roles.
+	if _, err := store.UpsertHost(&authz.Host{
+		ID: "direct-3", DisplayName: "db-3", ConnectionMode: authz.ConnModeDirect, SSHAddress: "10.0.1.12:22", AllowedLoginUsers: []string{"ops"},
+	}); err != nil {
+		t.Fatalf("third agentless direct host failed (nullable UNIQUE check): %v", err)
+	}
+	if _, err := store.UpsertCertRole(authz.CertRole{
+		ID: "r-sre", Subjects: []authz.SubjectSelector{{Group: "sre"}}, Principals: []string{"role:sre", "team:infra"}, MaxTTL: "2h", Extensions: []string{"permit-pty"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, deleted, err := store.DeleteCertRole("r-init"); err != nil || !deleted {
+		t.Fatalf("delete cert role failed: deleted=%v err=%v", deleted, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	doc, ok, err := db2.LoadDocument()
+	if err != nil || !ok {
+		t.Fatalf("reload failed: ok=%v err=%v", ok, err)
+	}
+	snap2, err := authz.Build(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap2.HostCount() != 3 {
+		t.Fatalf("hosts=%d, want 3", snap2.HostCount())
+	}
+	h3, ok := snap2.Host("direct-3")
+	if !ok || h3.ConnectionMode != authz.ConnModeDirect || h3.SSHAddress != "10.0.1.12:22" {
+		t.Fatalf("direct-3 mismatch: %+v", h3)
+	}
+	dec := snap2.DirectCertPolicy(authz.Subject{UserID: "u-1", Groups: []string{"sre"}}, nil)
+	if !dec.Allowed || len(dec.Principals) != 2 || dec.MaxTTL != 2*time.Hour {
+		t.Fatalf("persisted cert_role mismatch: %+v", dec)
+	}
+	if old := snap2.DirectCertPolicy(authz.Subject{UserID: "u-2", Groups: []string{"ops"}}, nil); old.Allowed {
+		t.Fatalf("deleted cert_role survived restart: %+v", old)
+	}
+}
+
+func TestSQLiteLegacyHostsSchemaMigration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	rawDB, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hk := genPubLine(t)
+	_, err = rawDB.Exec(`
+CREATE TABLE policy_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO policy_meta(key, value) VALUES ('scope', 'legacy'), ('admins', '[]'), ('disabled_users', '[]'), ('host_ca_public_keys', '[]');
+CREATE TABLE hosts (
+	id TEXT PRIMARY KEY,
+	display_name TEXT NOT NULL,
+	agent_id TEXT NOT NULL UNIQUE,
+	client_cert_cn TEXT NOT NULL UNIQUE,
+	disabled INTEGER NOT NULL DEFAULT 0,
+	doc_json TEXT NOT NULL
+);
+CREATE TABLE host_labels (
+	host_id TEXT NOT NULL,
+	k TEXT NOT NULL,
+	v TEXT NOT NULL,
+	PRIMARY KEY (host_id, k),
+	FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
+);
+INSERT INTO hosts(id, display_name, agent_id, client_cert_cn, disabled, doc_json)
+VALUES ('old-1', 'old-1', 'ag-1', 'ag-1', 0, '{"id":"old-1","display_name":"old-1","allowed_login_users":["ops"],"ssh_host_keys":["` + hk + `"],"agent":{"id":"ag-1","client_cert_cn":"ag-1"}}');
+INSERT INTO host_labels(host_id, k, v) VALUES ('old-1', 'env', 'prod');
+`)
+	if err != nil {
+		_ = rawDB.Close()
+		t.Fatal(err)
+	}
+	_ = rawDB.Close()
+
+	// Opening with OpenSQLite must migrate hosts to allow nullable agent_id/client_cert_cn
+	// without losing existing rows or labels!
+	db, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+	defer db.Close()
+	if err := db.UpsertHost(&authz.Host{
+		ID: "direct-new", DisplayName: "direct-new", ConnectionMode: authz.ConnModeDirect,
+		SSHAddress: "10.0.0.5:22", AllowedLoginUsers: []string{"ops"}, SSHHostKeys: []string{hk},
+	}); err != nil {
+		t.Fatalf("upsert agentless host after migration failed: %v", err)
+	}
+	doc, ok, err := db.LoadDocument()
+	if err != nil || !ok || len(doc.Hosts) != 2 {
+		t.Fatalf("reloaded doc: ok=%v hosts=%d err=%v", ok, len(doc.Hosts), err)
 	}
 }

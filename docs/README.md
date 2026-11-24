@@ -6,6 +6,7 @@
 | [protocol-single-wss.md](protocol-single-wss.md) | 单条 mTLS WSS + 按需 `smux v2`、分页与单二进制大规模演进规格（Phase 1–3） |
 | [deployment.md](deployment.md) | 部署：step-ca、目标主机 sshd、Agent mTLS、策略/SQLite、50k+ 调优 |
 | [native-ssh.md](native-ssh.md) | 用本机 OpenSSH 客户端和 ssh-agent 连接（`osmium login` / `osmium ssh`） |
+| [direct-ssh.md](direct-ssh.md) | 无 Agent 直连模式：Zero Trust SSH 证书签发、`osmium ssh-agent` 与 `ssh-config` 集成 |
 | [development.md](development.md) | 构建、测试与本地开发 |
 | [decisions.md](decisions.md) | 默认决定、架构方向与尚未实现的功能 |
 | [design/](design/) | 原始设计交接文档（handoff v0.2）：需求、协议、授权、验收用例 |

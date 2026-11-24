@@ -1,7 +1,7 @@
 // Package authz holds the trusted inventory (hosts, their Agent identities,
-// pinned SSH host keys and optional SSH Host CAs) and the access grants, and
-// answers "may this user open login L on host H right now". Browser input never
-// feeds into a decision other than as the (host_id, login_user) being asked about.
+// direct SSH addresses, pinned SSH host keys and optional SSH Host CAs),
+// access grants, and direct SSH certificate roles. Browser/CLI input never
+// feeds into authorization decisions except as the requested target.
 //
 // Snapshots pre-build sorted host slices, per-grant ID sets, and inverted label
 // indexes so cursor-paginated queries over 50,000+ hosts run in microseconds.
@@ -13,21 +13,41 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
 var (
-	idRe    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
-	loginRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
-	labelRe = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,63}$`)
+	idRe        = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+	loginRe     = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	labelRe     = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,63}$`)
+	principalRe = regexp.MustCompile(`^[A-Za-z0-9._:@-]{1,128}$`)
+	sshHostRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$`)
 )
+
+// Connection modes for a host entry.
+const (
+	ConnModeTunnel = "tunnel" // reverse mTLS WSS via osmium-agent (default)
+	ConnModeDirect = "direct" // direct SSH to agentless sshd using issued certs
+	ConnModeBoth   = "both"   // supports tunnel when agent is online, and direct fallback/choice
+)
+
+var validCertExtensions = map[string]bool{
+	"permit-pty":              true,
+	"permit-user-rc":          true,
+	"permit-port-forwarding":  true,
+	"permit-X11-forwarding":   true,
+	"permit-agent-forwarding": true,
+}
 
 // ValidLogin reports whether s is an acceptable Linux login name.
 func ValidLogin(s string) bool { return loginRe.MatchString(s) }
@@ -35,7 +55,31 @@ func ValidLogin(s string) bool { return loginRe.MatchString(s) }
 // ValidID reports whether s is an acceptable opaque identifier.
 func ValidID(s string) bool { return idRe.MatchString(s) }
 
-// Subject is the trusted identity of a Web user, taken from the login session.
+// ValidPrincipal reports whether s is a safe SSH certificate principal (no
+// wildcards, whitespace or control characters).
+func ValidPrincipal(s string) bool { return principalRe.MatchString(s) }
+
+// ValidateSSHAddress checks that addr is a safe host:port literal for direct
+// SSH connections (no whitespace, leading '-', '%', '@' or shell metacharacters).
+func ValidateSSHAddress(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid ssh_address %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid ssh_address port %q", portStr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return nil
+	}
+	if !sshHostRe.MatchString(host) {
+		return fmt.Errorf("invalid ssh_address host %q", host)
+	}
+	return nil
+}
+
+// Subject is the trusted identity of a Web/CLI user, taken from the login session.
 type Subject struct {
 	UserID  string
 	Issuer  string
@@ -87,10 +131,10 @@ func (s SubjectSelector) matches(u Subject) bool {
 	return false
 }
 
-// AgentBinding is the machine credential bound to a host.
+// AgentBinding is the machine credential bound to a tunnel-capable host.
 type AgentBinding struct {
-	ID           string `json:"id"`
-	ClientCertCN string `json:"client_cert_cn"`
+	ID           string `json:"id,omitempty"`
+	ClientCertCN string `json:"client_cert_cn,omitempty"`
 }
 
 // Host is a trusted inventory entry. PolicyLabels are maintained by the
@@ -98,17 +142,41 @@ type AgentBinding struct {
 type Host struct {
 	ID                 string            `json:"id"`
 	DisplayName        string            `json:"display_name"`
+	ConnectionMode     string            `json:"connection_mode,omitempty"` // "tunnel" (default), "direct", "both"
+	SSHAddress         string            `json:"ssh_address,omitempty"`     // trusted host:port for direct/both
 	PolicyLabels       map[string]string `json:"policy_labels"`
 	AllowedLoginUsers  []string          `json:"allowed_login_users"`
 	SSHHostKeys        []string          `json:"ssh_host_keys,omitempty"`
 	HostCertPrincipals []string          `json:"host_cert_principals,omitempty"`
 	Disabled           bool              `json:"disabled"`
-	Agent              AgentBinding      `json:"agent"`
+	Agent              AgentBinding      `json:"agent,omitempty"`
 
-	hostKeys    []ssh.PublicKey
-	allowedSet  map[string]struct{}
-	lowerID     string
-	lowerName   string
+	hostKeys   []ssh.PublicKey
+	allowedSet map[string]struct{}
+	lowerID    string
+	lowerName  string
+}
+
+// EffectiveMode returns the normalized connection mode ("tunnel", "direct", or "both").
+func (h *Host) EffectiveMode() string {
+	switch h.ConnectionMode {
+	case ConnModeDirect, ConnModeBoth:
+		return h.ConnectionMode
+	default:
+		return ConnModeTunnel
+	}
+}
+
+// AllowsDirect reports whether this host accepts direct (agentless) SSH connections.
+func (h *Host) AllowsDirect() bool {
+	m := h.EffectiveMode()
+	return m == ConnModeDirect || m == ConnModeBoth
+}
+
+// AllowsTunnel reports whether this host uses an osmium-agent reverse tunnel.
+func (h *Host) AllowsTunnel() bool {
+	m := h.EffectiveMode()
+	return m == ConnModeTunnel || m == ConnModeBoth
 }
 
 // HostKeys returns the pinned SSH plain host keys.
@@ -185,6 +253,30 @@ func cloneGrant(g Grant) Grant {
 	return cp
 }
 
+// CertRole grants matched subjects direct (agentless) role/group-level SSH
+// certificate principals and bounded TTL/extensions (used by osmium ssh-agent
+// and osmium cert login).
+type CertRole struct {
+	ID         string            `json:"id"`
+	Subjects   []SubjectSelector `json:"subjects"`
+	Principals []string          `json:"principals"`
+	MaxTTL     string            `json:"max_ttl,omitempty"`    // Go duration e.g. "4h" (1m..24h)
+	Extensions []string          `json:"extensions,omitempty"` // optional subset of allowed SSH extensions
+
+	maxTTLDuration time.Duration
+}
+
+func cloneCertRole(r CertRole) CertRole {
+	return CertRole{
+		ID:             r.ID,
+		Subjects:       slices.Clone(r.Subjects),
+		Principals:     slices.Clone(r.Principals),
+		MaxTTL:         r.MaxTTL,
+		Extensions:     slices.Clone(r.Extensions),
+		maxTTLDuration: r.maxTTLDuration,
+	}
+}
+
 // Document is the on-disk / persisted policy document.
 type Document struct {
 	Scope            string            `json:"scope"`
@@ -193,6 +285,7 @@ type Document struct {
 	HostCAPublicKeys []string          `json:"host_ca_public_keys,omitempty"`
 	Hosts            []*Host           `json:"hosts"`
 	Grants           []Grant           `json:"grants"`
+	CertRoles        []CertRole        `json:"cert_roles,omitempty"`
 }
 
 // Snapshot is an immutable, validated and indexed policy revision.
@@ -209,6 +302,7 @@ type Snapshot struct {
 	sortedHosts      []*Host
 	labelIndex       map[string]map[string][]*Host
 	grants           []Grant
+	certRoles        []CertRole
 }
 
 // HostCAs returns the parsed trusted SSH Host CA public keys.
@@ -230,6 +324,10 @@ func (s *Snapshot) Document() Document {
 	for _, g := range s.grants {
 		grants = append(grants, cloneGrant(g))
 	}
+	roles := make([]CertRole, 0, len(s.certRoles))
+	for _, r := range s.certRoles {
+		roles = append(roles, cloneCertRole(r))
+	}
 	return Document{
 		Scope:            s.Scope,
 		Admins:           slices.Clone(s.admins),
@@ -237,6 +335,7 @@ func (s *Snapshot) Document() Document {
 		HostCAPublicKeys: slices.Clone(s.hostCAPublicKeys),
 		Hosts:            hosts,
 		Grants:           grants,
+		CertRoles:        roles,
 	}
 }
 
@@ -259,6 +358,7 @@ func Build(doc Document) (*Snapshot, error) {
 		sortedHosts:      make([]*Host, 0, len(doc.Hosts)),
 		labelIndex:       make(map[string]map[string][]*Host),
 		grants:           make([]Grant, 0, len(doc.Grants)),
+		certRoles:        make([]CertRole, 0, len(doc.CertRoles)),
 	}
 	for i, a := range s.admins {
 		if err := a.validate(); err != nil {
@@ -292,17 +392,18 @@ func Build(doc Document) (*Snapshot, error) {
 		if s.hosts[h.ID] != nil {
 			return nil, fmt.Errorf("policy: duplicate host %q", h.ID)
 		}
-		if s.byAgentID[h.Agent.ID] != nil || s.byCN[h.Agent.ClientCertCN] != nil {
-			return nil, fmt.Errorf("policy: agent identity of host %q is not unique", h.ID)
+		if h.Agent.ID != "" {
+			if s.byAgentID[h.Agent.ID] != nil || s.byCN[h.Agent.ClientCertCN] != nil {
+				return nil, fmt.Errorf("policy: agent identity of host %q is not unique", h.ID)
+			}
+			s.byAgentID[h.Agent.ID] = h
+			s.byCN[h.Agent.ClientCertCN] = h
 		}
 		s.hosts[h.ID] = h
-		s.byAgentID[h.Agent.ID] = h
-		s.byCN[h.Agent.ClientCertCN] = h
 		s.sortedHosts = append(s.sortedHosts, h)
 	}
 	sort.Slice(s.sortedHosts, func(i, j int) bool { return s.sortedHosts[i].ID < s.sortedHosts[j].ID })
 
-	// Build inverted label index in sorted host-ID order for fast label queries.
 	for _, h := range s.sortedHosts {
 		for k, v := range h.PolicyLabels {
 			byVal := s.labelIndex[k]
@@ -321,6 +422,19 @@ func Build(doc Document) (*Snapshot, error) {
 		}
 		s.grants = append(s.grants, g)
 	}
+
+	seenRoleIDs := make(map[string]bool, len(doc.CertRoles))
+	for i, rawR := range doc.CertRoles {
+		r := cloneCertRole(rawR)
+		if err := validateAndCompileCertRole(&r, i); err != nil {
+			return nil, err
+		}
+		if seenRoleIDs[r.ID] {
+			return nil, fmt.Errorf("policy: duplicate cert_role %q", r.ID)
+		}
+		seenRoleIDs[r.ID] = true
+		s.certRoles = append(s.certRoles, r)
+	}
 	return s, nil
 }
 
@@ -330,6 +444,25 @@ func validateAndCompileHost(h *Host, hasHostCA bool) error {
 	}
 	if h.DisplayName == "" {
 		h.DisplayName = h.ID
+	}
+	switch h.ConnectionMode {
+	case "", ConnModeTunnel:
+		h.ConnectionMode = ConnModeTunnel
+	case ConnModeDirect, ConnModeBoth:
+	default:
+		return fmt.Errorf("policy: host %q has invalid connection_mode %q", h.ID, h.ConnectionMode)
+	}
+	if h.AllowsDirect() {
+		if h.SSHAddress == "" {
+			return fmt.Errorf("policy: direct host %q requires ssh_address", h.ID)
+		}
+		if err := ValidateSSHAddress(h.SSHAddress); err != nil {
+			return fmt.Errorf("policy: host %q: %w", h.ID, err)
+		}
+	} else if h.SSHAddress != "" {
+		if err := ValidateSSHAddress(h.SSHAddress); err != nil {
+			return fmt.Errorf("policy: host %q: %w", h.ID, err)
+		}
 	}
 	if h.PolicyLabels == nil {
 		h.PolicyLabels = map[string]string{}
@@ -368,8 +501,14 @@ func validateAndCompileHost(h *Host, hasHostCA bool) error {
 		}
 		h.hostKeys = append(h.hostKeys, k)
 	}
-	if !idRe.MatchString(h.Agent.ID) || h.Agent.ClientCertCN == "" {
-		return fmt.Errorf("policy: host %q needs agent.id and agent.client_cert_cn", h.ID)
+	if h.AllowsTunnel() {
+		if !idRe.MatchString(h.Agent.ID) || h.Agent.ClientCertCN == "" {
+			return fmt.Errorf("policy: host %q needs agent.id and agent.client_cert_cn", h.ID)
+		}
+	} else if h.Agent.ID != "" || h.Agent.ClientCertCN != "" {
+		if !idRe.MatchString(h.Agent.ID) || h.Agent.ClientCertCN == "" {
+			return fmt.Errorf("policy: host %q has incomplete agent binding", h.ID)
+		}
 	}
 	h.lowerID = strings.ToLower(h.ID)
 	h.lowerName = strings.ToLower(h.DisplayName)
@@ -397,6 +536,38 @@ func validateAndCompileGrant(g *Grant, idx int) error {
 		g.Hosts.idSet = make(map[string]struct{}, len(g.Hosts.IDs))
 		for _, id := range g.Hosts.IDs {
 			g.Hosts.idSet[id] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func validateAndCompileCertRole(r *CertRole, idx int) error {
+	if !idRe.MatchString(r.ID) {
+		return fmt.Errorf("policy: cert_roles[%d] invalid id %q", idx, r.ID)
+	}
+	if len(r.Subjects) == 0 || len(r.Principals) == 0 || len(r.Principals) > 32 {
+		return fmt.Errorf("policy: cert_roles[%d] needs subjects and 1..32 principals", idx)
+	}
+	for _, sub := range r.Subjects {
+		if err := sub.validate(); err != nil {
+			return fmt.Errorf("policy: cert_roles[%d]: %w", idx, err)
+		}
+	}
+	for _, p := range r.Principals {
+		if !principalRe.MatchString(p) {
+			return fmt.Errorf("policy: cert_roles[%d] invalid principal %q", idx, p)
+		}
+	}
+	if r.MaxTTL != "" {
+		d, err := time.ParseDuration(r.MaxTTL)
+		if err != nil || d < time.Minute || d > 24*time.Hour {
+			return fmt.Errorf("policy: cert_roles[%d] max_ttl must be 1m..24h", idx)
+		}
+		r.maxTTLDuration = d
+	}
+	for _, ext := range r.Extensions {
+		if !validCertExtensions[ext] {
+			return fmt.Errorf("policy: cert_roles[%d] unsupported extension %q", idx, ext)
 		}
 	}
 	return nil
@@ -532,6 +703,102 @@ func (s *Snapshot) Check(u Subject, hostID, login string) Decision {
 	return d
 }
 
+// CheckDirectHost checks whether u may obtain a single-host direct SSH
+// certificate for (hostID, login).
+func (s *Snapshot) CheckDirectHost(u Subject, hostID, login string) (Decision, *Host) {
+	d := s.Check(u, hostID, login)
+	if !d.Allowed {
+		return d, nil
+	}
+	h := s.hosts[hostID]
+	if !h.AllowsDirect() {
+		return Decision{Revision: s.Revision, Reason: "direct_not_enabled"}, nil
+	}
+	return d, h
+}
+
+// DirectCertDecision holds the server-computed role/group principals, TTL cap
+// and allowed extensions for a direct (agentless) multi-host certificate.
+type DirectCertDecision struct {
+	Allowed    bool
+	Reason     string
+	Revision   uint64
+	Principals []string
+	MaxTTL     time.Duration // 0 means defer to CA/server default
+	Extensions []string      // nil means defer to CA/server default
+}
+
+// DirectCertPolicy evaluates all CertRoles matching u. If requestedPrincipals
+// is non-empty, every requested principal must be within the authorized set
+// (fail-closed if any unauthorized principal is requested).
+func (s *Snapshot) DirectCertPolicy(u Subject, requestedPrincipals []string) DirectCertDecision {
+	d := DirectCertDecision{Revision: s.Revision}
+	if s.IsDisabled(u) {
+		d.Reason = "user_disabled"
+		return d
+	}
+	pSet := make(map[string]struct{})
+	extSet := make(map[string]struct{})
+	hasExplicitExt := false
+	var minCap time.Duration
+
+	for _, r := range s.certRoles {
+		if !slices.ContainsFunc(r.Subjects, func(sel SubjectSelector) bool { return sel.matches(u) }) {
+			continue
+		}
+		for _, p := range r.Principals {
+			pSet[p] = struct{}{}
+		}
+		if r.maxTTLDuration > 0 && (minCap == 0 || r.maxTTLDuration < minCap) {
+			minCap = r.maxTTLDuration
+		}
+		if len(r.Extensions) > 0 {
+			hasExplicitExt = true
+			for _, ext := range r.Extensions {
+				extSet[ext] = struct{}{}
+			}
+		}
+	}
+	if len(pSet) == 0 {
+		d.Reason = "no_cert_roles"
+		return d
+	}
+
+	var finalPrincipals []string
+	if len(requestedPrincipals) > 0 {
+		seen := make(map[string]bool, len(requestedPrincipals))
+		for _, rp := range requestedPrincipals {
+			if _, ok := pSet[rp]; !ok {
+				d.Reason = "principal_not_granted"
+				return d
+			}
+			if !seen[rp] {
+				seen[rp] = true
+				finalPrincipals = append(finalPrincipals, rp)
+			}
+		}
+	} else {
+		for p := range pSet {
+			finalPrincipals = append(finalPrincipals, p)
+		}
+	}
+	sort.Strings(finalPrincipals)
+	if len(finalPrincipals) > 32 {
+		finalPrincipals = finalPrincipals[:32]
+	}
+
+	d.Allowed = true
+	d.Principals = finalPrincipals
+	d.MaxTTL = minCap
+	if hasExplicitExt {
+		for ext := range extSet {
+			d.Extensions = append(d.Extensions, ext)
+		}
+		sort.Strings(d.Extensions)
+	}
+	return d
+}
+
 func (s *Snapshot) hasLoginGrant(u Subject, h *Host, login string) bool {
 	if _, ok := h.allowedSet[login]; !ok {
 		return false
@@ -572,7 +839,7 @@ func (s *Snapshot) VisibleHosts(u Subject) []*Host {
 type HostPageQuery struct {
 	Labels map[string]string
 	Query  string // case-insensitive substring on ID or DisplayName
-	Status string // optional: "ready", "offline", "disabled"
+	Status string // optional: "ready", "direct", "offline", "disabled"
 	Cursor string // exclusive lower bound on host.ID
 	Limit  int    // 1..500 (default 50)
 }
@@ -592,8 +859,6 @@ type HostPageResult struct {
 	Total      int
 }
 
-// candidatesForFilter picks the smallest pre-sorted candidate slice using the
-// inverted label index before checking authorization.
 func (s *Snapshot) candidatesForFilter(labels map[string]string) []*Host {
 	if len(labels) == 0 {
 		return s.sortedHosts
@@ -637,7 +902,6 @@ func (s *Snapshot) VisibleHostsPage(u Subject, q HostPageQuery, statusFn func(*H
 	var res HostPageResult
 	hasMore := false
 	for _, h := range candidates {
-		// Check remaining label filters (when >1 label specified).
 		if len(q.Labels) > 1 {
 			ok := true
 			for k, v := range q.Labels {
@@ -697,6 +961,8 @@ type Persister interface {
 	DeleteHost(hostID string) error
 	UpsertGrant(g Grant) error
 	DeleteGrant(grantID string) error
+	UpsertCertRole(r CertRole) error
+	DeleteCertRole(roleID string) error
 	SaveHostCAs(keys []string) error
 	SaveDisabledUsers(disabled []SubjectSelector) error
 }
@@ -766,8 +1032,7 @@ func (st *Store) OnHostChange(f func(snap *Snapshot, agentIDs []string)) {
 	st.mu.Unlock()
 }
 
-// UpsertHost atomically validates, persists and installs an updated or new host
-// without requiring a full policy file reload.
+// UpsertHost atomically validates, persists and installs an updated or new host.
 func (st *Store) UpsertHost(h *Host) (*Snapshot, error) {
 	st.mu.Lock()
 	doc := st.cur.Document()
@@ -775,7 +1040,9 @@ func (st *Store) UpsertHost(h *Host) (*Snapshot, error) {
 	replaced := false
 	for i, existing := range doc.Hosts {
 		if existing.ID == h.ID {
-			affectedAgents = append(affectedAgents, existing.Agent.ID)
+			if existing.Agent.ID != "" {
+				affectedAgents = append(affectedAgents, existing.Agent.ID)
+			}
 			doc.Hosts[i] = cloneHost(h)
 			replaced = true
 			break
@@ -784,7 +1051,7 @@ func (st *Store) UpsertHost(h *Host) (*Snapshot, error) {
 	if !replaced {
 		doc.Hosts = append(doc.Hosts, cloneHost(h))
 	}
-	if !slices.Contains(affectedAgents, h.Agent.ID) {
+	if h.Agent.ID != "" && !slices.Contains(affectedAgents, h.Agent.ID) {
 		affectedAgents = append(affectedAgents, h.Agent.ID)
 	}
 	snap, err := Build(doc)
@@ -805,7 +1072,7 @@ func (st *Store) UpsertHost(h *Host) (*Snapshot, error) {
 	hls := slices.Clone(st.hostListeners)
 	st.mu.Unlock()
 
-	if len(hls) > 0 {
+	if len(affectedAgents) > 0 {
 		for _, hl := range hls {
 			hl(snap, affectedAgents)
 		}
@@ -816,8 +1083,7 @@ func (st *Store) UpsertHost(h *Host) (*Snapshot, error) {
 	return snap, nil
 }
 
-// DeleteHost removes a single host and notifies listeners so its Agent and
-// active sessions are terminated.
+// DeleteHost removes a single host and notifies listeners.
 func (st *Store) DeleteHost(hostID string) (*Snapshot, bool, error) {
 	st.mu.Lock()
 	doc := st.cur.Document()
@@ -853,8 +1119,10 @@ func (st *Store) DeleteHost(hostID string) (*Snapshot, bool, error) {
 	hls := slices.Clone(st.hostListeners)
 	st.mu.Unlock()
 
-	for _, hl := range hls {
-		hl(snap, []string{agentID})
+	if agentID != "" {
+		for _, hl := range hls {
+			hl(snap, []string{agentID})
+		}
 	}
 	for _, l := range ls {
 		l(snap)
@@ -903,8 +1171,7 @@ func (st *Store) UpsertGrant(g Grant) (*Snapshot, error) {
 	return snap, nil
 }
 
-// DeleteGrant removes one grant by ID and notifies listeners so revoked
-// sessions are closed immediately.
+// DeleteGrant removes one grant by ID and notifies listeners.
 func (st *Store) DeleteGrant(grantID string) (*Snapshot, bool, error) {
 	st.mu.Lock()
 	doc := st.cur.Document()
@@ -943,9 +1210,88 @@ func (st *Store) DeleteGrant(grantID string) (*Snapshot, bool, error) {
 	return snap, true, nil
 }
 
-// SetHostCAs updates the trusted SSH Host CA public keys (supporting seamless
-// key rotation). Fails closed if removing all CAs leaves any host without
-// pinned ssh_host_keys.
+// UpsertCertRole atomically validates, persists and activates a direct cert role.
+func (st *Store) UpsertCertRole(r CertRole) (*Snapshot, error) {
+	if !ValidID(r.ID) {
+		return nil, fmt.Errorf("policy: invalid cert_role id %q", r.ID)
+	}
+	st.mu.Lock()
+	doc := st.cur.Document()
+	replaced := false
+	for i, existing := range doc.CertRoles {
+		if existing.ID == r.ID {
+			doc.CertRoles[i] = cloneCertRole(r)
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		doc.CertRoles = append(doc.CertRoles, cloneCertRole(r))
+	}
+	snap, err := Build(doc)
+	if err != nil {
+		st.mu.Unlock()
+		return nil, err
+	}
+	if st.persister != nil {
+		if err := st.persister.UpsertCertRole(r); err != nil {
+			st.mu.Unlock()
+			return nil, err
+		}
+	}
+	st.rev++
+	snap.Revision = st.rev
+	st.cur = snap
+	ls := slices.Clone(st.listeners)
+	st.mu.Unlock()
+
+	for _, l := range ls {
+		l(snap)
+	}
+	return snap, nil
+}
+
+// DeleteCertRole removes one direct cert role by ID.
+func (st *Store) DeleteCertRole(roleID string) (*Snapshot, bool, error) {
+	st.mu.Lock()
+	doc := st.cur.Document()
+	idx := -1
+	for i, existing := range doc.CertRoles {
+		if existing.ID == roleID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		st.mu.Unlock()
+		return st.cur, false, nil
+	}
+	doc.CertRoles = append(doc.CertRoles[:idx], doc.CertRoles[idx+1:]...)
+	snap, err := Build(doc)
+	if err != nil {
+		st.mu.Unlock()
+		return nil, false, err
+	}
+	if st.persister != nil {
+		if err := st.persister.DeleteCertRole(roleID); err != nil {
+			st.mu.Unlock()
+			return nil, false, err
+		}
+	}
+	st.rev++
+	snap.Revision = st.rev
+	st.cur = snap
+	ls := slices.Clone(st.listeners)
+	st.mu.Unlock()
+
+	for _, l := range ls {
+		l(snap)
+	}
+	return snap, true, nil
+}
+
+// SetHostCAs updates the trusted SSH Host CA public keys. Fails closed if
+// removing all CAs leaves any host without pinned ssh_host_keys.
 func (st *Store) SetHostCAs(keys []string) (*Snapshot, error) {
 	st.mu.Lock()
 	doc := st.cur.Document()

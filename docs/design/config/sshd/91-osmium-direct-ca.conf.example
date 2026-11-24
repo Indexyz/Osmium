@@ -1,0 +1,19 @@
+# Example fragment ONLY for agentless (direct) sshd hosts.
+# Review against actual sshd configuration (`sshd -T` and `sshd -t`) and keep
+# out-of-band emergency access before applying in production.
+# Files are public trust metadata, NOT private keys.
+PubkeyAuthentication yes
+TrustedUserCAKeys /etc/ssh/osmium_user_ca.pub
+AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u
+
+# Optional: present a Host Certificate signed by Osmium's trusted SSH Host CA
+# so clients verify host identity automatically without per-host key pinning:
+# HostKey /etc/ssh/ssh_host_ed25519_key
+# HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub
+
+# Example /etc/ssh/auth_principals/ops (one principal per line):
+#   tenant:t1:host:edge-db-1:login:ops    # single-host exact principal (osmium ssh / cert sign)
+#   role:prod-ops                         # role/group principal (osmium ssh-agent / cert login)
+#
+# This fragment does NOT disable password, authorized_keys, other CAs or root.
+# Do not globally remove emergency access. See docs/design/config/README.md.

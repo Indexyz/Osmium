@@ -81,9 +81,19 @@ describe("App", () => {
               {
                 id: "host-123",
                 display_name: "prod-web-1",
+                connection_mode: "tunnel",
                 status: "ready",
                 policy_labels: { env: "prod" },
                 allowed_login_users: ["ops", "deploy"],
+              },
+              {
+                id: "host-direct-1",
+                display_name: "edge-db-1",
+                connection_mode: "direct",
+                ssh_address: "10.0.2.15:22",
+                status: "direct",
+                policy_labels: { env: "prod", role: "db" },
+                allowed_login_users: ["ops"],
               },
             ],
             next_cursor: "c2",
@@ -98,6 +108,8 @@ describe("App", () => {
 
     render(<App />);
     expect(await screen.findByText("prod-web-1")).toBeInTheDocument();
+    expect(screen.getByText("edge-db-1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "仅 CLI 直连" })).toBeDisabled();
     expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.getByText(/共 2 台匹配主机/)).toBeInTheDocument();
 

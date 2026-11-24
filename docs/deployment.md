@@ -55,7 +55,8 @@ Agent 仅向 Server 发起**一条 mTLS WSS**（`/agent/v1/tunnel`），并通�
 
 对于超过数千台设备的部署，建议在 `server.json` 中配置 `"state_db": "/var/lib/osmium/osmium.db"`（使用内嵌纯 Go SQLite WAL，仍为单二进制零外部依赖）：
 - 首次启动若数据库为空且提供了 `policy_file`，会自动导入初始策略；
-- 之后可通过管理员增量 API（`PUT/DELETE /api/v1/admin/hosts/{id}`、`PUT/DELETE /api/v1/admin/grants/{id}`、`PUT /api/v1/admin/host-cas`）秒级修改单台主机或授权，仅精确影响目标主机，无需重写整个 `policy.json`；
+- 策略文件同样支持无 Agent 直连主机（`connection_mode: "direct"` 或 `"both"`）与角色级证书策略（`cert_roles`），配合 `server.json` 中的独立 `direct_ca` 配置项使用，详见 [direct-ssh.md](direct-ssh.md)。
+- 之后可通过管理员增量 API（`PUT/DELETE /api/v1/admin/hosts/{id}`、`PUT/DELETE /api/v1/admin/grants/{id}`、`GET/PUT/DELETE /api/v1/admin/cert-roles/{id}`、`PUT /api/v1/admin/host-cas`）秒级修改单台主机、授权或证书角色，仅精确影响目标主机，无需重写整个 `policy.json`；
 - Web 登录会话、CLI 令牌与审计索引均持久化在 `state_db` 中，Server 重启不丢登录态且审计检索走本地索引；
 - 仍兼容修改 `policy_file` 后向 Server 发送 `SIGHUP` 全量同步（未配置 `state_db` 时退回纯文件热加载）。
 

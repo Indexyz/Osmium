@@ -6,10 +6,20 @@
     {
       "id": "host-123",
       "display_name": "prod-web-1",
+      "connection_mode": "tunnel",
       "policy_labels": {"env": "prod", "role": "web"},
       "allowed_login_users": ["deploy", "ops"],
       "ssh_host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaIVaeoO7KLvIrJT1KhprUFC/l1liRbnqh8PSLRkz4v"],
       "agent": {"id": "agent-123", "client_cert_cn": "agent-123"}
+    },
+    {
+      "id": "edge-db-1",
+      "display_name": "prod-db-direct-1",
+      "connection_mode": "direct",
+      "ssh_address": "10.0.2.15:22",
+      "policy_labels": {"env": "prod", "role": "db"},
+      "allowed_login_users": ["ops"],
+      "ssh_host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaIVaeoO7KLvIrJT1KhprUFC/l1liRbnqh8PSLRkz4v"]
     }
   ],
   "grants": [
@@ -24,6 +34,15 @@
       "subjects": [{"issuer": "https://idp.example.com", "subject": "alice-oidc-sub"}],
       "hosts": {"ids": ["host-123"]},
       "logins": ["deploy"]
+    }
+  ],
+  "cert_roles": [
+    {
+      "id": "prod-ops-direct",
+      "subjects": [{"group": "ops"}],
+      "principals": ["role:prod-ops"],
+      "max_ttl": "4h",
+      "extensions": ["permit-pty", "permit-user-rc", "permit-port-forwarding"]
     }
   ]
 }

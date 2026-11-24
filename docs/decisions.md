@@ -7,6 +7,10 @@
 - **设备规模与负载特征**：目标承载 **>50,000 台设备**，且平时 **99% 设备处于空闲态**（仅少量并发活跃 SSH 会话）。
 - **部署形态**：优先**单二进制部署**（不强依赖外置数据库/缓存集群；服务端可选启用内嵌纯 Go SQLite WAL 持久化）。
 - **Agent 通道形态**：同意放弃旧 ADR-04 的“控制 WSS + 独立常驻数据 WSS”双连接建议基线，改用**单条 mTLS WSS**（`/agent/v1/tunnel`，子协议 `web-ssh-tunnel.v2`），并在有活跃 SSH 时按需拉起/空闲自动休眠 `smux v2`。详细规格见 [protocol-single-wss.md](protocol-single-wss.md)。
+- **无 Agent 直连 Zero Trust SSH 方向**：
+  - 除 NAT 后主机走 `osmium-agent` 隧道外，明确要求支持为**无 Agent 的普通 `sshd` 服务器**签发真实 SSH 用户证书，覆盖三种客户端形态：`osmium ssh` 自动直连、`osmium cert`/`osmium ssh-config` 原生 OpenSSH 集成，以及内置本地只读 `osmium ssh-agent` 守护进程（内存持有、自动轮换、吊销清零）。Web 浏览器终端保持仅走隧道模式，不直接发起服务端直连 TCP。
+  - 隧道模式保持单主机精确 principal（~60s）；直连模式同时支持**单主机精确 principal** 短期证书与基于 `cert_roles` 的**角色/组级多主机 principal + 中长有效期（默认 4h，上限可配）**证书。
+  - `source-address` 限制设为独立可选配置（`direct_ca.source_address_mode`：`none` / `static` / `client_ip`），与隧道模式的 loopback 模板解耦。详见 [direct-ssh.md](direct-ssh.md)。
 
 ## 当前实现基线（对应未决项）
 
@@ -46,4 +50,4 @@
 - Agent mTLS 证书 CRL/OCSP 在线吊销检查（当前通过删除/禁用主机立即踢出在线连接并拒绝重连）。
 - 完整管理后台 UI（目前提供管理员 API：主机/授权/Host CA 增量 CRUD、`/api/v1/admin/agents`、`/api/v1/admin/audit`、`/api/v1/admin/cli-tokens`、`POST /api/v1/admin/cli-tokens/{id}/revoke`、`POST /api/v1/admin/users/{id}/revoke`）与 Prometheus `/metrics`。
 - 会话录制，以及显式受控的 SFTP / 端口转发产品能力。
-- Windows 平台的原生 `osmium ssh` 客户端支持（当前依赖 Unix domain socket 与 POSIX `ProxyCommand`）。
+- Windows 平台的原生隧道模式 `osmium ssh` 客户端支持（直连模式 `osmium ssh --direct` / `direct` 主机已跨平台支持，但隧道模式当前仍依赖 POSIX `ProxyCommand`）。

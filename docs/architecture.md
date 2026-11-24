@@ -2,13 +2,15 @@
 
 ```
 浏览器 ──HTTPS/WSS──┐
-                    ├─▶ Server（Web API + SSH Gateway + 256 分片 Agent Hub + 内嵌 SQLite WAL）──HTTPS──▶ step-ca
-osmium CLI + ssh ───┘          ▲
-                               │ 单条 mTLS WSS（/agent/v1/tunnel, web-ssh-tunnel.v2）
-                               │ • 空闲态：WS Ping/Pong + Text 控制帧（无 smux 常驻开销）
-                               │ • 活跃态：按需拉起 Binary [4B mux_gen][smux v2]（空闲自动休眠）
-                               │
-                            Agent ──TCP──▶ 127.0.0.1:22（sshd）
+                    ├─▶ Server（Web API + SSH Gateway + Direct Cert CA + 256 分片 Agent Hub + 内嵌 SQLite WAL）──HTTPS──▶ step-ca
+osmium CLI /        │          ▲
+osmium ssh-agent ───┘          │ 单条 mTLS WSS（/agent/v1/tunnel, web-ssh-tunnel.v2）
+       │                       │ • 空闲态：WS Ping/Pong + Text 控制帧（无 smux 常驻开销）
+       │                       │ • 活跃态：按需拉起 Binary [4B mux_gen][smux v2]（空闲自动休眠）
+       │                       │
+       │                    Agent ──TCP──▶ 127.0.0.1:22（NAT/受限主机 sshd）
+       │
+       └────────── 直连 TCP SSH（短期用户证书 + Host CA 校验）──────────▶ 无 Agent 普通 sshd
 ```
 
 详细协议与大规模规格见 [protocol-single-wss.md](protocol-single-wss.md)（单条 WSS + 按需 smux + 分页/持久化/Host CA）以及历史设计交接文档 [design/02-architecture.md](design/02-architecture.md) 和 [design/05-protocols.md](design/05-protocols.md)。
@@ -29,7 +31,8 @@ osmium CLI + ssh ───┘          ▲
     2. 按需激活目标 Agent 的 `smux v2` 并打开 stream，Agent 确认拨通 sshd 后，向 step-ca 申请签发短期证书，principal 为 `tenant:<scope>:host:<id>:login:<user>`；
     3. 校验返回的证书；
     4. 使用登记的固定主机公钥或信任的 **SSH Host CA**（校验签名、有效期与主机 principal）严格验证目标主机身份，然后建立 PTY shell，通过 React + Ghostty（`ghostty-web` WASM）呈现给浏览器。
-  - **原生模式**：用户本机的 OpenSSH 客户端与 sshd 端到端通信，Server 只做授权、签发证书、下发固定 host key / Host CA 与字节转发，看不到明文。见 [native-ssh.md](native-ssh.md)。
+  - **原生隧道模式**：用户本机的 OpenSSH 客户端与 NAT 后 sshd 端到端通信，Server 只做授权、签发证书、下发固定 host key / Host CA 与字节转发，看不到明文。见 [native-ssh.md](native-ssh.md)。
+  - **无 Agent 直连模式**：针对网络可达的普通 `sshd` 服务器，Server 通过独立 `direct_ca` provisioner 签发单主机短期证书（默认 60s）或角色/组级中短期证书（如 1h–8h，经 `cert_roles` 授权与封顶，并支持可选 `source-address` 限制）。CLI 提供 `osmium ssh` 自动直连、`osmium cert`、`osmium ssh-config` 与内置只读常驻 `osmium ssh-agent`（内存持有、自动轮换密钥、吊销秒清）。见 [direct-ssh.md](direct-ssh.md)。
 - **授权与持久化**完全在服务端（[design/03-authorization.md](design/03-authorization.md)）：
   - 支持可选内嵌纯 Go SQLite（WAL 模式，`state_db`）单二进制持久化主机、标签、授权、Host CA、Web 会话、CLI 令牌与审计索引，同时保留 `policy_file` 兼容导入与 `SIGHUP` 重载；
   - 提供管理员增量 API（主机/授权/Host CA 增删改），变更仅精确影响相关主机，无需全量扫描；

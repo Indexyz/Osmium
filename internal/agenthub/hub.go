@@ -288,6 +288,9 @@ func (h *Hub) notify(hostID string) {
 // ReconcileHost checks a single agent/host binding against snap without
 // scanning every shard (used by incremental admin host updates).
 func (h *Hub) ReconcileHost(snap *authz.Snapshot, agentID string) {
+	if agentID == "" {
+		return
+	}
 	sh := h.shard(agentID)
 	sh.mu.RLock()
 	p := sh.byAgent[agentID]
@@ -296,7 +299,7 @@ func (h *Hub) ReconcileHost(snap *authz.Snapshot, agentID string) {
 		return
 	}
 	host, ok := snap.HostByAgentCN(p.cn)
-	if !ok || host.ID != p.hostID || host.Agent.ID != p.agentID || host.Disabled {
+	if !ok || host.ID != p.hostID || host.Agent.ID != p.agentID || host.Disabled || !host.AllowsTunnel() {
 		h.log.Info("closing agent epoch after host change", "agent_id", p.agentID, "epoch", p.epoch)
 		p.cancel()
 	}
@@ -310,7 +313,7 @@ func (h *Hub) reconcilePolicy(s *authz.Snapshot) {
 		sh.mu.RLock()
 		for _, p := range sh.byAgent {
 			host, ok := s.HostByAgentCN(p.cn)
-			if !ok || host.ID != p.hostID || host.Agent.ID != p.agentID || host.Disabled {
+			if !ok || host.ID != p.hostID || host.Agent.ID != p.agentID || host.Disabled || !host.AllowsTunnel() {
 				stale = append(stale, p)
 			}
 		}
@@ -322,22 +325,32 @@ func (h *Hub) reconcilePolicy(s *authz.Snapshot) {
 	}
 }
 
-// Status returns the host status for the directory. Under the single-WSS
-// protocol an authenticated Agent is immediately "ready" (smux activates on
-// demand when the first SSH stream opens).
+// Status returns the host status for the directory:
+//   - "disabled" when the host is disabled;
+//   - "direct" for agentless direct-only hosts (or dual-mode hosts whose agent is offline);
+//   - "ready" when a tunnel-capable host has a live Agent epoch;
+//   - "offline" otherwise.
 func (h *Hub) Status(host *authz.Host) string {
 	if host.Disabled {
 		return "disabled"
 	}
-	sh := h.shard(host.Agent.ID)
-	sh.mu.RLock()
-	p := sh.byAgent[host.Agent.ID]
-	ok := p != nil && p.hostID == host.ID && p.ctx.Err() == nil
-	sh.mu.RUnlock()
-	if !ok {
-		return "offline"
+	if host.EffectiveMode() == authz.ConnModeDirect {
+		return "direct"
 	}
-	return "ready"
+	if host.Agent.ID != "" {
+		sh := h.shard(host.Agent.ID)
+		sh.mu.RLock()
+		p := sh.byAgent[host.Agent.ID]
+		ok := p != nil && p.hostID == host.ID && p.ctx.Err() == nil
+		sh.mu.RUnlock()
+		if ok {
+			return "ready"
+		}
+	}
+	if host.EffectiveMode() == authz.ConnModeBoth {
+		return "direct"
+	}
+	return "offline"
 }
 
 // agentIdentity maps the verified client certificate to the inventory entry.
@@ -352,6 +365,9 @@ func (h *Hub) agentIdentity(r *http.Request) (*authz.Host, string, error) {
 	}
 	if host.Disabled {
 		return nil, cn, errors.New("host disabled")
+	}
+	if !host.AllowsTunnel() {
+		return nil, cn, errors.New("host tunnel mode disabled")
 	}
 	return host, cn, nil
 }
@@ -696,7 +712,7 @@ func (s *Stream) Close() error {
 // already authorized, activating smux v2 on demand if the host was idle.
 func (h *Hub) OpenStream(ctx context.Context, hostID, sessionID, attemptID string) (*Stream, error) {
 	host, ok := h.store.Current().Host(hostID)
-	if !ok || host.Disabled {
+	if !ok || host.Disabled || !host.AllowsTunnel() || host.Agent.ID == "" {
 		return nil, ErrNotReady
 	}
 	sh := h.shard(host.Agent.ID)

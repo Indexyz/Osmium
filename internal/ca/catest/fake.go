@@ -105,7 +105,7 @@ func (f *FakeCA) sign(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	opts, err := f.verifyToken(req.OTT)
+	opts, sourceAddr, reqExts, err := f.verifyToken(req.OTT)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -114,7 +114,7 @@ func (f *FakeCA) sign(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this provisioner is for SSH user certificates only", http.StatusForbidden)
 		return
 	}
-	if len(opts.Principals) != 1 || !slices.Equal(req.Principals, opts.Principals) || req.KeyID != opts.KeyID {
+	if len(opts.Principals) == 0 || !slices.Equal(req.Principals, opts.Principals) || req.KeyID != opts.KeyID {
 		http.Error(w, "request does not match token", http.StatusForbidden)
 		return
 	}
@@ -124,8 +124,25 @@ func (f *FakeCA) sign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	validity := f.Validity
+	if opts.ValidBefore != "" {
+		if d, err := time.ParseDuration(opts.ValidBefore); err == nil && d > 0 {
+			validity = d
+		}
+	}
 	var serial [8]byte
 	_, _ = rand.Read(serial[:])
+	crit := map[string]string{}
+	if sourceAddr != "" {
+		crit["source-address"] = sourceAddr
+	}
+	exts := map[string]string{"permit-pty": ""}
+	if len(reqExts) > 0 {
+		exts = make(map[string]string, len(reqExts))
+		for _, e := range reqExts {
+			exts[e] = ""
+		}
+	}
 	cert := &ssh.Certificate{
 		Key:             pub,
 		Serial:          binary.BigEndian.Uint64(serial[:]),
@@ -133,8 +150,11 @@ func (f *FakeCA) sign(w http.ResponseWriter, r *http.Request) {
 		KeyId:           opts.KeyID,
 		ValidPrincipals: opts.Principals,
 		ValidAfter:      uint64(now.Add(-f.Backdate).Unix()),
-		ValidBefore:     uint64(now.Add(f.Validity).Unix()),
-		Permissions:     ssh.Permissions{Extensions: map[string]string{"permit-pty": ""}},
+		ValidBefore:     uint64(now.Add(validity).Unix()),
+		Permissions: ssh.Permissions{
+			CriticalOptions: crit,
+			Extensions:      exts,
+		},
 	}
 	f.mu.Lock()
 	mutate := f.Mutate
@@ -154,31 +174,31 @@ func (f *FakeCA) sign(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"crt": base64.StdEncoding.EncodeToString(cert.Marshal())})
 }
 
-func (f *FakeCA) verifyToken(tok string) (*ca.SSHOptions, error) {
+func (f *FakeCA) verifyToken(tok string) (*ca.SSHOptions, string, []string, error) {
 	parsed, err := jwt.ParseSigned(tok, []jose.SignatureAlgorithm{jose.ES256, jose.EdDSA, jose.RS256})
 	if err != nil {
-		return nil, errors.New("invalid token")
+		return nil, "", nil, errors.New("invalid token")
 	}
 	if len(parsed.Headers) != 1 || parsed.Headers[0].KeyID != f.JWK.KeyID {
-		return nil, errors.New("wrong kid")
+		return nil, "", nil, errors.New("wrong kid")
 	}
 	var c ca.TokenClaims
 	if err := parsed.Claims(f.JWK.Public().Key, &c); err != nil {
-		return nil, errors.New("bad signature")
+		return nil, "", nil, errors.New("bad signature")
 	}
 	if err := c.ValidateWithLeeway(jwt.Expected{Issuer: f.Provisioner, AnyAudience: jwt.Audience{f.Audience(), f.Server.URL + "/ssh/sign"}, Time: time.Now()}, time.Minute); err != nil {
-		return nil, err
+		return nil, "", nil, err
 	}
 	if c.Subject == "" || c.ID == "" || c.Step.SSH == nil {
-		return nil, errors.New("not an SSH token")
+		return nil, "", nil, errors.New("not an SSH token")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.used[c.ID] {
-		return nil, errors.New("token already used")
+		return nil, "", nil, errors.New("token already used")
 	}
 	f.used[c.ID] = true
-	return c.Step.SSH, nil
+	return c.Step.SSH, c.SourceAddress, c.Extensions, nil
 }
 
 // SetDown toggles CA availability.

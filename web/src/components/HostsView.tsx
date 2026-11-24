@@ -22,6 +22,7 @@ interface Props {
 
 const STATUS_LABELS: Record<HostItem["status"], string> = {
   ready: "ready",
+  direct: "direct",
   connecting: "connecting",
   offline: "offline",
   disabled: "disabled",
@@ -78,6 +79,7 @@ export default function HostsView({
         >
           <option value="">全部状态</option>
           <option value="ready">在线 (ready)</option>
+          <option value="direct">直连 (direct)</option>
           <option value="offline">离线 (offline)</option>
           <option value="disabled">已禁用 (disabled)</option>
         </select>
@@ -154,14 +156,25 @@ export default function HostsView({
                     </select>
                   </td>
                   <td className="hosts-table__action-col">
-                    <button
-                      type="button"
-                      className="btn btn--primary"
-                      disabled={host.status !== "ready" || !login}
-                      onClick={() => onConnect(host, login)}
-                    >
-                      连接
-                    </button>
+                    {host.status === "direct" ? (
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled
+                        title={`该主机为无 Agent 直连模式，请在终端执行：osmium ssh ${login ? `${login}@` : ""}${host.id}`}
+                      >
+                        仅 CLI 直连
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn--primary"
+                        disabled={host.status !== "ready" || !login}
+                        onClick={() => onConnect(host, login)}
+                      >
+                        连接
+                      </button>
+                    )}
                   </td>
                 </tr>
               );

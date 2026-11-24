@@ -33,9 +33,9 @@ type Credentials struct {
 	} `json:"user"`
 }
 
-// CredentialsPath returns the default credentials file location. OSMIUM_CONFIG
-// overrides the directory.
-func CredentialsPath() (string, error) {
+// ConfigDir returns the local osmium client configuration directory.
+// OSMIUM_CONFIG overrides the default OS user config location.
+func ConfigDir() (string, error) {
 	dir := os.Getenv("OSMIUM_CONFIG")
 	if dir == "" {
 		base, err := os.UserConfigDir()
@@ -43,6 +43,16 @@ func CredentialsPath() (string, error) {
 			return "", err
 		}
 		dir = filepath.Join(base, "osmium")
+	}
+	return dir, nil
+}
+
+// CredentialsPath returns the default credentials file location. OSMIUM_CONFIG
+// overrides the directory.
+func CredentialsPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
 	}
 	return filepath.Join(dir, "credentials.json"), nil
 }
@@ -209,9 +219,47 @@ func (a *API) do(ctx context.Context, method, path string, in, out any) error {
 type Host struct {
 	ID                string            `json:"id"`
 	DisplayName       string            `json:"display_name"`
+	ConnectionMode    string            `json:"connection_mode"`
+	SSHAddress        string            `json:"ssh_address,omitempty"`
 	Status            string            `json:"status"`
 	PolicyLabels      map[string]string `json:"policy_labels"`
 	AllowedLoginUsers []string          `json:"allowed_login_users"`
+}
+
+// DirectCertRequest requests a direct (agentless) SSH user certificate.
+type DirectCertRequest struct {
+	Mode       string   `json:"mode"`                 // "host" or "role"
+	HostID     string   `json:"host_id,omitempty"`    // required when mode == "host"
+	LoginUser  string   `json:"login_user,omitempty"` // required when mode == "host"
+	Principals []string `json:"principals,omitempty"` // optional subset when mode == "role"
+	TTL        string   `json:"ttl,omitempty"`        // optional Go duration; server-capped
+	PublicKey  string   `json:"public_key"`           // ephemeral ed25519/ecdsa public key
+}
+
+// DirectCertResponse is the server response from POST /api/v1/direct-certs.
+type DirectCertResponse struct {
+	CertID             string    `json:"cert_id"`
+	Mode               string    `json:"mode"`
+	Certificate        string    `json:"certificate"`
+	KeyID              string    `json:"key_id"`
+	Serial             string    `json:"serial"`
+	Principals         []string  `json:"principals"`
+	ValidAfter         time.Time `json:"valid_after"`
+	ValidBefore        time.Time `json:"valid_before"`
+	SourceAddress      string    `json:"source_address,omitempty"`
+	SSHAddress         string    `json:"ssh_address,omitempty"`
+	HostKeys           []string  `json:"host_keys,omitempty"`
+	HostCAs            []string  `json:"host_cas,omitempty"`
+	HostCertPrincipals []string  `json:"host_cert_principals,omitempty"`
+}
+
+// MeResponse is the response from GET /api/v1/me.
+type MeResponse struct {
+	User struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"display_name"`
+	} `json:"user"`
+	IsAdmin bool `json:"is_admin"`
 }
 
 // HostPageQuery filters and paginates visible hosts.
@@ -275,6 +323,57 @@ func (a *API) Hosts(ctx context.Context, labels []string) ([]Host, error) {
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// FindHost looks up a single host by exact ID without pulling the full fleet.
+func (a *API) FindHost(ctx context.Context, hostID string) (*Host, error) {
+	cursor := ""
+	for {
+		page, err := a.HostsPage(ctx, HostPageQuery{Query: hostID, Cursor: cursor, Limit: 50})
+		if err != nil {
+			return nil, err
+		}
+		for i := range page.Items {
+			if page.Items[i].ID == hostID {
+				h := page.Items[i]
+				return &h, nil
+			}
+		}
+		if page.NextCursor == "" || len(page.Items) == 0 {
+			return nil, fmt.Errorf("host %s not found or not accessible", hostID)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// IssueDirectCert requests a short-lived direct SSH certificate for an
+// ephemeral public key from POST /api/v1/direct-certs.
+func (a *API) IssueDirectCert(ctx context.Context, req DirectCertRequest) (*DirectCertResponse, error) {
+	var out DirectCertResponse
+	if err := a.do(ctx, http.MethodPost, "/api/v1/direct-certs", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// HostCAs fetches the server's trusted SSH Host CA public keys.
+func (a *API) HostCAs(ctx context.Context) ([]string, error) {
+	var out struct {
+		HostCAPublicKeys []string `json:"host_ca_public_keys"`
+	}
+	if err := a.do(ctx, http.MethodGet, "/api/v1/host-cas", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.HostCAPublicKeys, nil
+}
+
+// Me validates the active credentials against GET /api/v1/me.
+func (a *API) Me(ctx context.Context) (*MeResponse, error) {
+	var out MeResponse
+	if err := a.do(ctx, http.MethodGet, "/api/v1/me", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Logout revokes the token on the Server.

@@ -191,3 +191,90 @@ func TestIndexedPaginationAndHostCAValidation(t *testing.T) {
 		t.Fatalf("dev label widened visibility: %+v", pDev)
 	}
 }
+
+func TestDirectHostAndCertRolePolicy(t *testing.T) {
+	raw := `{
+		"scope": "t1",
+		"admins": [{"group": "admins"}],
+		"disabled_users": [{"user_id": "u-eve"}],
+		"host_ca_public_keys": ["` + hostKey + `"],
+		"hosts": [
+			{"id": "tunnel-1", "connection_mode": "tunnel", "allowed_login_users": ["ops"], "agent": {"id": "a-1", "client_cert_cn": "a-1"}},
+			{"id": "direct-1", "connection_mode": "direct", "ssh_address": "10.0.2.15:22", "allowed_login_users": ["ops", "deploy"]},
+			{"id": "both-1", "connection_mode": "both", "ssh_address": "db.internal:2222", "allowed_login_users": ["ops"], "agent": {"id": "a-both", "client_cert_cn": "a-both"}}
+		],
+		"grants": [
+			{"id": "g1", "subjects": [{"group": "ops"}], "hosts": {"ids": ["tunnel-1", "direct-1", "both-1"]}, "logins": ["ops"]}
+		],
+		"cert_roles": [
+			{"id": "r-ops", "subjects": [{"group": "ops"}], "principals": ["role:prod-ops", "team:sre"], "max_ttl": "4h", "extensions": ["permit-pty", "permit-port-forwarding"]},
+			{"id": "r-short", "subjects": [{"user_id": "u-alice"}], "principals": ["role:db-ro"], "max_ttl": "2h", "extensions": ["permit-pty"]}
+		]
+	}`
+	snap := mustParse(t, raw)
+
+	aliceOps := Subject{UserID: "u-alice", Groups: []string{"ops"}}
+	eveOps := Subject{UserID: "u-eve", Groups: []string{"ops"}}
+
+	// CheckDirectHost allows direct and both hosts, rejects tunnel-only host.
+	if d, h := snap.CheckDirectHost(aliceOps, "direct-1", "ops"); !d.Allowed || h == nil || h.SSHAddress != "10.0.2.15:22" {
+		t.Fatalf("direct-1 denied: %+v %+v", d, h)
+	}
+	if d, h := snap.CheckDirectHost(aliceOps, "both-1", "ops"); !d.Allowed || h == nil || h.SSHAddress != "db.internal:2222" {
+		t.Fatalf("both-1 denied: %+v %+v", d, h)
+	}
+	if d, _ := snap.CheckDirectHost(aliceOps, "tunnel-1", "ops"); d.Allowed || d.Reason != "direct_not_enabled" {
+		t.Fatalf("tunnel-1 should fail direct check: %+v", d)
+	}
+	if d, _ := snap.CheckDirectHost(eveOps, "direct-1", "ops"); d.Allowed || d.Reason != "user_disabled" {
+		t.Fatalf("disabled user allowed direct host: %+v", d)
+	}
+
+	// DirectCertPolicy computes union of principals, tightest TTL cap, and fail-closed subset check.
+	dec := snap.DirectCertPolicy(aliceOps, nil)
+	if !dec.Allowed || len(dec.Principals) != 3 || dec.Principals[0] != "role:db-ro" || dec.Principals[1] != "role:prod-ops" || dec.Principals[2] != "team:sre" {
+		t.Fatalf("unexpected role principals: %+v", dec)
+	}
+	if dec.MaxTTL.Hours() != 2 {
+		t.Fatalf("expected tightest max_ttl=2h, got %s", dec.MaxTTL)
+	}
+	// Narrowing subset succeeds.
+	sub := snap.DirectCertPolicy(aliceOps, []string{"role:prod-ops"})
+	if !sub.Allowed || len(sub.Principals) != 1 || sub.Principals[0] != "role:prod-ops" {
+		t.Fatalf("subset denied: %+v", sub)
+	}
+	// Requesting an unauthorized principal fails closed.
+	if bad := snap.DirectCertPolicy(aliceOps, []string{"role:prod-ops", "root"}); bad.Allowed || bad.Reason != "principal_not_granted" {
+		t.Fatalf("unauthorized principal accepted: %+v", bad)
+	}
+	// Disabled user and user without roles are rejected.
+	if bad := snap.DirectCertPolicy(eveOps, nil); bad.Allowed || bad.Reason != "user_disabled" {
+		t.Fatalf("disabled user got role cert: %+v", bad)
+	}
+	if bad := snap.DirectCertPolicy(bob, nil); bad.Allowed || bad.Reason != "no_cert_roles" {
+		t.Fatalf("unmatched user got role cert: %+v", bad)
+	}
+
+	// Negative validation cases for direct hosts and cert_roles.
+	badDocs := []string{
+		// direct host missing ssh_address
+		`{"scope":"t1","host_ca_public_keys":["` + hostKey + `"],"hosts":[{"id":"d1","connection_mode":"direct","allowed_login_users":["ops"]}]}`,
+		// direct host with dangerous ssh_address option injection
+		`{"scope":"t1","host_ca_public_keys":["` + hostKey + `"],"hosts":[{"id":"d1","connection_mode":"direct","ssh_address":"-oProxyCommand=id:22","allowed_login_users":["ops"]}]}`,
+		// direct host with invalid port
+		`{"scope":"t1","host_ca_public_keys":["` + hostKey + `"],"hosts":[{"id":"d1","connection_mode":"direct","ssh_address":"10.0.0.1:99999","allowed_login_users":["ops"]}]}`,
+		// both host missing agent binding
+		`{"scope":"t1","host_ca_public_keys":["` + hostKey + `"],"hosts":[{"id":"b1","connection_mode":"both","ssh_address":"10.0.0.1:22","allowed_login_users":["ops"]}]}`,
+		// cert_role with wildcard principal
+		`{"scope":"t1","cert_roles":[{"id":"r1","subjects":[{"group":"ops"}],"principals":["*"]}]}`,
+		// cert_role with excessive TTL
+		`{"scope":"t1","cert_roles":[{"id":"r1","subjects":[{"group":"ops"}],"principals":["role:ops"],"max_ttl":"48h"}]}`,
+		// cert_role with unknown extension
+		`{"scope":"t1","cert_roles":[{"id":"r1","subjects":[{"group":"ops"}],"principals":["role:ops"],"extensions":["permit-anything"]}]}`,
+	}
+	for i, s := range badDocs {
+		if _, err := Parse(strings.NewReader(s)); err == nil {
+			t.Fatalf("bad doc case %d unexpectedly accepted", i)
+		}
+	}
+}

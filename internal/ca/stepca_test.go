@@ -156,3 +156,58 @@ func TestVerifierRequiredSourceAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestDirectMultiPrincipalAndDynamicSourceAddress(t *testing.T) {
+	f, _ := setup(t)
+	cfg, err := f.ClientConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxLifetime = 8*time.Hour + time.Minute
+	cfg.AllowedExts = []string{"permit-pty", "permit-user-rc", "permit-port-forwarding"}
+	c, err := ca.NewStepCA(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := newReq(t)
+	req.Principal = ""
+	req.Principals = []string{"role:prod-ops", "team:sre"}
+	req.ValidBefore = "4h"
+	req.SourceAddress = "203.0.113.7/32"
+	req.Extensions = []string{"permit-pty", "permit-port-forwarding"}
+
+	cert, err := c.SignUserCert(context.Background(), req)
+	if err != nil {
+		t.Fatalf("multi-principal direct sign failed: %v", err)
+	}
+	if len(cert.ValidPrincipals) != 2 || cert.CriticalOptions["source-address"] != "203.0.113.7/32" {
+		t.Fatalf("unexpected cert: principals=%v crit=%v", cert.ValidPrincipals, cert.CriticalOptions)
+	}
+	if _, ok := cert.Extensions["permit-port-forwarding"]; !ok {
+		t.Fatalf("missing expected extension: %v", cert.Extensions)
+	}
+
+	// Negative: CA drops a principal, changes source-address, or adds extension outside role subset.
+	badCases := map[string]func(*ssh.Certificate){
+		"missing_principal": func(x *ssh.Certificate) { x.ValidPrincipals = []string{"role:prod-ops"} },
+		"wrong_source_addr": func(x *ssh.Certificate) { x.CriticalOptions["source-address"] = "0.0.0.0/0" },
+		"drop_source_addr":  func(x *ssh.Certificate) { x.CriticalOptions = map[string]string{} },
+		"role_disallowed_ext": func(x *ssh.Certificate) {
+			// permit-user-rc is in CA AllowedExts, but NOT in req.Extensions!
+			x.Extensions["permit-user-rc"] = ""
+		},
+	}
+	for name, mut := range badCases {
+		f.SetMutate(mut)
+		r2 := newReq(t)
+		r2.Principal = ""
+		r2.Principals = req.Principals
+		r2.ValidBefore = req.ValidBefore
+		r2.SourceAddress = req.SourceAddress
+		r2.Extensions = req.Extensions
+		if _, err := c.SignUserCert(context.Background(), r2); err == nil {
+			t.Fatalf("%s: expected rejection", name)
+		}
+	}
+}

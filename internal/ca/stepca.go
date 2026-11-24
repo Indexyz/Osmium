@@ -25,12 +25,26 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Request describes one certificate for one connection attempt. Every field
-// is derived by the server, never taken from the browser.
+// Request describes one certificate for one connection or direct-login attempt.
+// Every field is derived by the server, never taken from untrusted client claims.
 type Request struct {
-	PublicKey ssh.PublicKey
-	KeyID     string
-	Principal string
+	PublicKey     ssh.PublicKey
+	KeyID         string
+	Principal     string   // single principal (Tunnel & single-host Direct)
+	Principals    []string // multi-principal (Direct role/group cert); takes precedence if non-empty
+	ValidBefore   string   // optional per-request duration override (capped by Verifier.maxLifetime)
+	SourceAddress string   // optional per-request critical option source-address override
+	Extensions    []string // optional per-request allowed SSH extension subset (enforced by Verifier)
+}
+
+func (r Request) principals() []string {
+	if len(r.Principals) > 0 {
+		return r.Principals
+	}
+	if r.Principal != "" {
+		return []string{r.Principal}
+	}
+	return nil
 }
 
 // Signer issues SSH user certificates.
@@ -189,8 +203,10 @@ type SSHOptions struct {
 // TokenClaims is the JWK provisioning token payload for SSH signing.
 type TokenClaims struct {
 	jwt.Claims
-	SANs []string `json:"sans,omitempty"`
-	Step struct {
+	SANs          []string `json:"sans,omitempty"`
+	SourceAddress string   `json:"osmium_source_address,omitempty"`
+	Extensions    []string `json:"osmium_extensions,omitempty"`
+	Step          struct {
 		SSH *SSHOptions `json:"ssh"`
 	} `json:"step"`
 }
@@ -203,6 +219,13 @@ func randomHex(n int) string {
 
 // Token builds a one-time JWK provisioning token bound to r.
 func Token(signer jose.Signer, issuer, audience string, r Request, validBefore string, now time.Time) (string, error) {
+	ps := r.principals()
+	if len(ps) == 0 {
+		return "", errors.New("ca: at least one principal is required")
+	}
+	if r.ValidBefore != "" {
+		validBefore = r.ValidBefore
+	}
 	var c TokenClaims
 	c.Issuer = issuer
 	c.Subject = r.KeyID
@@ -211,8 +234,10 @@ func Token(signer jose.Signer, issuer, audience string, r Request, validBefore s
 	c.NotBefore = jwt.NewNumericDate(now)
 	c.Expiry = jwt.NewNumericDate(now.Add(2 * time.Minute))
 	c.ID = randomHex(16)
-	c.SANs = []string{r.Principal}
-	c.Step.SSH = &SSHOptions{CertType: "user", KeyID: r.KeyID, Principals: []string{r.Principal}, ValidBefore: validBefore}
+	c.SANs = ps
+	c.SourceAddress = strings.TrimSpace(r.SourceAddress)
+	c.Extensions = slices.Clone(r.Extensions)
+	c.Step.SSH = &SSHOptions{CertType: "user", KeyID: r.KeyID, Principals: ps, ValidBefore: validBefore}
 	return jwt.Signed(signer).Claims(c).Serialize()
 }
 
@@ -234,7 +259,15 @@ type SignResponse struct {
 // SignUserCert implements Signer. A timeout never triggers a retry here: the
 // caller abandons the attempt and a new attempt uses a new key and token.
 func (s *StepCA) SignUserCert(ctx context.Context, r Request) (*ssh.Certificate, error) {
-	ott, err := Token(s.signer, s.cfg.ProvisionerName, s.cfg.Audience, r, s.cfg.ValidBefore, time.Now())
+	ps := r.principals()
+	if len(ps) == 0 {
+		return nil, errors.New("ca: at least one principal is required")
+	}
+	validBefore := s.cfg.ValidBefore
+	if r.ValidBefore != "" {
+		validBefore = r.ValidBefore
+	}
+	ott, err := Token(s.signer, s.cfg.ProvisionerName, s.cfg.Audience, r, validBefore, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("ca: build token: %w", err)
 	}
@@ -243,8 +276,8 @@ func (s *StepCA) SignUserCert(ctx context.Context, r Request) (*ssh.Certificate,
 		OTT:         ott,
 		CertType:    "user",
 		KeyID:       r.KeyID,
-		Principals:  []string{r.Principal},
-		ValidBefore: s.cfg.ValidBefore,
+		Principals:  ps,
+		ValidBefore: validBefore,
 	})
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
@@ -357,19 +390,29 @@ func (v *Verifier) Verify(cert *ssh.Certificate, r Request, now time.Time) error
 	if !slices.ContainsFunc(v.cas, func(k ssh.PublicKey) bool { return bytes.Equal(k.Marshal(), cert.SignatureKey.Marshal()) }) {
 		return fail("signed by an untrusted CA")
 	}
-	if len(cert.ValidPrincipals) != 1 || cert.ValidPrincipals[0] != r.Principal {
+	wantPrincipals := r.principals()
+	if len(wantPrincipals) == 0 || len(cert.ValidPrincipals) != len(wantPrincipals) {
 		return fail("principal set mismatch")
+	}
+	for _, wp := range wantPrincipals {
+		if !slices.Contains(cert.ValidPrincipals, wp) {
+			return fail("principal set mismatch")
+		}
 	}
 	if cert.KeyId != r.KeyID {
 		return fail("key id mismatch")
 	}
+	expectedSourceAddr := v.requiredSourceAddr
+	if strings.TrimSpace(r.SourceAddress) != "" {
+		expectedSourceAddr = strings.TrimSpace(r.SourceAddress)
+	}
 	var supportedCritical []string
-	if v.requiredSourceAddr == "" {
+	if expectedSourceAddr == "" {
 		if len(cert.CriticalOptions) != 0 {
 			return fail("unexpected critical options")
 		}
 	} else {
-		if len(cert.CriticalOptions) != 1 || cert.CriticalOptions["source-address"] != v.requiredSourceAddr {
+		if len(cert.CriticalOptions) != 1 || cert.CriticalOptions["source-address"] != expectedSourceAddr {
 			return fail("source-address critical option mismatch")
 		}
 		supportedCritical = []string{"source-address"}
@@ -377,6 +420,9 @@ func (v *Verifier) Verify(cert *ssh.Certificate, r Request, now time.Time) error
 	for ext := range cert.Extensions {
 		if !slices.Contains(v.allowedExts, ext) {
 			return fail("unexpected extension " + ext)
+		}
+		if len(r.Extensions) > 0 && !slices.Contains(r.Extensions, ext) {
+			return fail("extension not permitted for role: " + ext)
 		}
 	}
 	unix := uint64(now.Unix())
@@ -393,7 +439,7 @@ func (v *Verifier) Verify(cert *ssh.Certificate, r Request, now time.Time) error
 		Clock:                    func() time.Time { return now },
 		SupportedCriticalOptions: supportedCritical,
 	}
-	if err := checker.CheckCert(r.Principal, cert); err != nil {
+	if err := checker.CheckCert(wantPrincipals[0], cert); err != nil {
 		return fail(err.Error())
 	}
 	return nil

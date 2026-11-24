@@ -93,6 +93,20 @@ type CA struct {
 	RequiredSourceAddress string   `json:"required_source_address"`
 }
 
+// DirectCA configures the optional dedicated step-ca provisioner and policy
+// used for issuing direct (agentless) SSH user certificates. Separating it from
+// the tunnel CA allows independent TTLs (e.g. 4h for role certs vs 60s for
+// tunnel attempts) and independent source-address rules.
+type DirectCA struct {
+	CA
+	DefaultHostTTL     Duration `json:"default_host_ttl"`     // default 60s
+	DefaultRoleTTL     Duration `json:"default_role_ttl"`     // default 4h
+	MaxRoleTTL         Duration `json:"max_role_ttl"`         // default 8h
+	SourceAddressMode  string   `json:"source_address_mode"`  // "", "none", "static", "client_ip"
+	SourceAddressCIDRs string   `json:"source_address_cidrs"` // used when source_address_mode == "static"
+	TrustedProxies     []string `json:"trusted_proxies"`      // CIDRs allowed to supply X-Forwarded-For in client_ip mode
+}
+
 // Sessions holds session policy knobs.
 type Sessions struct {
 	AttachTimeout      Duration `json:"attach_timeout"`
@@ -146,10 +160,11 @@ type Server struct {
 	SecureCookie *bool    `json:"secure_cookie"`
 	WebSession   Duration `json:"web_session_ttl"`
 
-	Audit    Audit    `json:"audit"`
-	CA       CA       `json:"ca"`
-	Sessions Sessions `json:"sessions"`
-	Smux     Smux     `json:"smux"`
+	Audit    Audit     `json:"audit"`
+	CA       CA        `json:"ca"`
+	DirectCA *DirectCA `json:"direct_ca,omitempty"`
+	Sessions Sessions  `json:"sessions"`
+	Smux     Smux      `json:"smux"`
 
 	TicketTTL         Duration `json:"tunnel_ticket_ttl"` // deprecated; ignored in single-WSS protocol
 	PingInterval      Duration `json:"ping_interval"`

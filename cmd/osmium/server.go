@@ -190,6 +190,21 @@ func runServer(cfgPath string, log *slog.Logger) error {
 		return err
 	}
 
+	var directIssuer *server.DirectCertIssuer
+	if cfg.DirectCA != nil {
+		directIssuer, err = buildDirectIssuer(cfg, caKeys)
+		if err != nil {
+			return err
+		}
+		log.Info("direct SSH certificate issuance enabled",
+			"source_address_mode", cfg.DirectCA.SourceAddressMode,
+			"default_role_ttl", cfg.DirectCA.DefaultRoleTTL.D(),
+			"max_role_ttl", cfg.DirectCA.MaxRoleTTL.D(),
+		)
+	} else if doc := snap.Document(); len(doc.CertRoles) > 0 || hasDirectHost(doc.Hosts) {
+		log.Warn("policy defines direct hosts or cert_roles, but direct_ca is not configured; POST /api/v1/direct-certs will stay disabled")
+	}
+
 	hub := agenthub.New(agenthub.Config{
 		ServerID:          cfg.ServerID,
 		Mux:               cfg.Smux.Mux(),
@@ -263,7 +278,7 @@ func runServer(cfgPath string, log *slog.Logger) error {
 		}
 	})
 
-	srv := &server.Server{Store: store, Hub: hub, Sessions: mgr, Auth: auth, Audit: aud, Log: log, AllowedOrigins: []string{pub.Scheme + "://" + pub.Host}}
+	srv := &server.Server{Store: store, Hub: hub, Sessions: mgr, Direct: directIssuer, Auth: auth, Audit: aud, Log: log, AllowedOrigins: []string{pub.Scheme + "://" + pub.Host}}
 
 	// SIGHUP reloads policy_file (when configured) and syncs to state_db.
 	if cfg.PolicyFile != "" {
@@ -322,4 +337,87 @@ func runServer(cfgPath string, log *slog.Logger) error {
 	_ = webSrv.Shutdown(sctx)
 	_ = agentSrv.Shutdown(sctx)
 	return nil
+}
+
+func hasDirectHost(hosts []*authz.Host) bool {
+	for _, h := range hosts {
+		if h.AllowsDirect() {
+			return true
+		}
+	}
+	return false
+}
+
+func buildDirectIssuer(cfg *config.Server, fallbackCAKeys []string) (*server.DirectCertIssuer, error) {
+	dc := cfg.DirectCA
+	url := dc.URL
+	if url == "" {
+		url = cfg.CA.URL
+	}
+	rootCA := dc.RootCAFile
+	if rootCA == "" {
+		rootCA = cfg.CA.RootCAFile
+	}
+	prov := dc.ProvisionerName
+	if prov == "" {
+		prov = cfg.CA.ProvisionerName
+	}
+	jwkFile := dc.JWKFile
+	jwkPass := dc.JWKPasswordFile
+	if jwkFile == "" {
+		jwkFile = cfg.CA.JWKFile
+		jwkPass = cfg.CA.JWKPasswordFile
+	}
+	caKeys := fallbackCAKeys
+	if dc.UserCAPublicKeyFile != "" {
+		var err error
+		caKeys, err = readUserCAKeys(dc.UserCAPublicKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("direct_ca: %w", err)
+		}
+	}
+	maxRoleTTL := dc.MaxRoleTTL.D()
+	if maxRoleTTL <= 0 {
+		maxRoleTTL = 8 * time.Hour
+	}
+	maxLife := dc.MaxCertLifetime.D()
+	if maxLife <= 0 {
+		// Allow slight clock-skew headroom above server-capped role TTL.
+		maxLife = maxRoleTTL + 30*time.Second
+	}
+	allowedExts := dc.AllowedExtensions
+	if allowedExts == nil {
+		allowedExts = []string{"permit-pty", "permit-user-rc", "permit-port-forwarding"}
+	}
+	reqSource := dc.RequiredSourceAddress
+	if dc.SourceAddressMode == "static" && reqSource == "" {
+		reqSource = dc.SourceAddressCIDRs
+	}
+	directSigner, err := ca.NewStepCA(ca.StepConfig{
+		URL:                   url,
+		RootCAFile:            rootCA,
+		ProvisionerName:       prov,
+		JWKFile:               jwkFile,
+		JWKPasswordFile:       jwkPass,
+		Audience:              dc.Audience,
+		SignPath:              dc.SignPath,
+		ValidBefore:           dc.ValidBefore,
+		Timeout:               dc.Timeout.D(),
+		UserCAPublicKeys:      caKeys,
+		MaxLifetime:           maxLife,
+		AllowedExts:           allowedExts,
+		RequiredSourceAddress: reqSource,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("direct_ca: %w", err)
+	}
+	return server.NewDirectCertIssuer(directSigner, server.DirectCertConfig{
+		DefaultHostTTL:     dc.DefaultHostTTL.D(),
+		DefaultRoleTTL:     dc.DefaultRoleTTL.D(),
+		MaxRoleTTL:         maxRoleTTL,
+		SourceAddressMode:  dc.SourceAddressMode,
+		SourceAddressCIDRs: dc.SourceAddressCIDRs,
+		TrustedProxies:     dc.TrustedProxies,
+		MaxConcurrentSigns: cfg.Sessions.MaxConcurrentSigns,
+	})
 }

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,9 @@ type SSHOptions struct {
 	// NoAgent writes the private key to a private temp file instead of
 	// loading it into the ssh-agent at SSH_AUTH_SOCK.
 	NoAgent bool
+	// Direct forces direct (agentless) certificate mode instead of using the
+	// Agent tunnel when connecting to a direct or dual-mode host.
+	Direct bool
 
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer
@@ -61,31 +65,81 @@ func (a *API) ResolveLogin(ctx context.Context, hostID, login string) (string, e
 	if login != "" {
 		return login, nil
 	}
-	cursor := ""
-	for {
-		page, err := a.HostsPage(ctx, HostPageQuery{Query: hostID, Cursor: cursor, Limit: 50})
-		if err != nil {
-			return "", err
-		}
-		for _, h := range page.Items {
-			if h.ID != hostID {
-				continue
-			}
-			if len(h.AllowedLoginUsers) == 1 {
-				return h.AllowedLoginUsers[0], nil
-			}
-			return "", fmt.Errorf("host %s allows several logins (%s); use login@%s", hostID, strings.Join(h.AllowedLoginUsers, ", "), hostID)
-		}
-		if page.NextCursor == "" || len(page.Items) == 0 {
-			break
-		}
-		cursor = page.NextCursor
+	h, err := a.FindHost(ctx, hostID)
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("host %s not found or not accessible", hostID)
+	if len(h.AllowedLoginUsers) == 1 {
+		return h.AllowedLoginUsers[0], nil
+	}
+	return "", fmt.Errorf("host %s allows several logins (%s); use login@%s", hostID, strings.Join(h.AllowedLoginUsers, ", "), hostID)
 }
 
-// SSH runs the user's OpenSSH client against hostID through a native tunnel
-// and returns ssh's exit code.
+func nullKnownHostsPath() string {
+	if runtime.GOOS == "windows" {
+		return "none"
+	}
+	return "/dev/null"
+}
+
+func parseHostTrust(rawHostKeys, rawHostCAs []string) ([]ssh.PublicKey, []ssh.PublicKey, error) {
+	var hostKeys []ssh.PublicKey
+	for _, k := range rawHostKeys {
+		hk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k))
+		if err != nil {
+			return nil, nil, errors.New("server returned an invalid host key")
+		}
+		if _, isCert := hk.(*ssh.Certificate); isCert {
+			return nil, nil, errors.New("server returned a certificate as host key")
+		}
+		hostKeys = append(hostKeys, hk)
+	}
+	var hostCAs []ssh.PublicKey
+	for _, k := range rawHostCAs {
+		caKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k))
+		if err != nil {
+			return nil, nil, errors.New("server returned an invalid host CA key")
+		}
+		if _, isCert := caKey.(*ssh.Certificate); isCert {
+			return nil, nil, errors.New("server returned a certificate as host CA")
+		}
+		hostCAs = append(hostCAs, caKey)
+	}
+	if len(hostKeys) == 0 && len(hostCAs) == 0 {
+		return nil, nil, errors.New("server returned neither pinned host keys nor host CAs")
+	}
+	return hostKeys, hostCAs, nil
+}
+
+func formatKnownHosts(hostID string, hostKeys, hostCAs []ssh.PublicKey, hostCertPrincipals []string) (alias string, content string) {
+	alias = "osmium-" + hostID
+	if len(hostCAs) > 0 {
+		// When verifying a Host Certificate, OpenSSH checks the HostKeyAlias
+		// against the certificate's principals.
+		alias = hostID
+		if len(hostCertPrincipals) > 0 && hostCertPrincipals[0] != "" {
+			alias = hostCertPrincipals[0]
+		}
+	}
+	var kh strings.Builder
+	for _, k := range hostKeys {
+		kh.WriteString(alias + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k))) + "\n")
+	}
+	if len(hostCAs) > 0 {
+		principals := alias
+		if len(hostCertPrincipals) > 0 {
+			principals = strings.Join(hostCertPrincipals, ",")
+		}
+		for _, caKey := range hostCAs {
+			kh.WriteString("@cert-authority " + principals + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(caKey))) + "\n")
+		}
+	}
+	return alias, kh.String()
+}
+
+// SSH runs the user's OpenSSH client against hostID (automatically selecting
+// direct certificate mode for direct hosts or dual-mode hosts whose agent is
+// offline, or native tunnel mode otherwise) and returns ssh's exit code.
 func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 	if o.SSHBinary == "" {
 		o.SSHBinary = "ssh"
@@ -98,20 +152,46 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 			fmt.Fprintf(o.Stderr, "osmium: "+format+"\n", args...)
 		}
 	}
+	sshPath, err := exec.LookPath(o.SSHBinary)
+	if err != nil {
+		return 0, fmt.Errorf("OpenSSH client not found: %w", err)
+	}
+
+	useDirect := o.Direct
+	login := o.Login
+	if !useDirect {
+		if host, herr := a.FindHost(ctx, o.HostID); herr == nil {
+			if login == "" {
+				if len(host.AllowedLoginUsers) == 1 {
+					login = host.AllowedLoginUsers[0]
+				} else {
+					return 0, fmt.Errorf("host %s allows several logins (%s); use login@%s", o.HostID, strings.Join(host.AllowedLoginUsers, ", "), o.HostID)
+				}
+			}
+			if host.ConnectionMode == "direct" || (host.ConnectionMode == "both" && host.Status != "ready") {
+				useDirect = true
+			}
+		} else if login == "" {
+			return 0, herr
+		}
+	} else if login == "" {
+		login, err = a.ResolveLogin(ctx, o.HostID, o.Login)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	if useDirect {
+		logf("connecting to %s via direct SSH certificate mode", o.HostID)
+		return a.sshDirect(ctx, o, sshPath, login, logf)
+	}
+
 	if len(o.ProxyCommand) == 0 {
 		self, err := os.Executable()
 		if err != nil {
 			return 0, err
 		}
 		o.ProxyCommand = []string{self, "proxy-connect"}
-	}
-	sshPath, err := exec.LookPath(o.SSHBinary)
-	if err != nil {
-		return 0, fmt.Errorf("OpenSSH client not found: %w", err)
-	}
-	login, err := a.ResolveLogin(ctx, o.HostID, o.Login)
-	if err != nil {
-		return 0, err
 	}
 
 	// One fresh key per connection attempt; it never leaves this machine.
@@ -145,30 +225,9 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 	if err != nil || !ok || string(cert.Key.Marshal()) != string(sshPub.Marshal()) {
 		return 0, errors.New("server returned a certificate for a different key")
 	}
-	var hostKeys []ssh.PublicKey
-	for _, k := range ready.HostKeys {
-		hk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k))
-		if err != nil {
-			return 0, errors.New("server returned an invalid host key")
-		}
-		if _, isCert := hk.(*ssh.Certificate); isCert {
-			return 0, errors.New("server returned a certificate as host key")
-		}
-		hostKeys = append(hostKeys, hk)
-	}
-	var hostCAs []ssh.PublicKey
-	for _, k := range ready.HostCAs {
-		caKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k))
-		if err != nil {
-			return 0, errors.New("server returned an invalid host CA key")
-		}
-		if _, isCert := caKey.(*ssh.Certificate); isCert {
-			return 0, errors.New("server returned a certificate as host CA")
-		}
-		hostCAs = append(hostCAs, caKey)
-	}
-	if len(hostKeys) == 0 && len(hostCAs) == 0 {
-		return 0, errors.New("server returned neither pinned host keys nor host CAs")
+	hostKeys, hostCAs, err := parseHostTrust(ready.HostKeys, ready.HostCAs)
+	if err != nil {
+		return 0, err
 	}
 
 	dir, err := os.MkdirTemp("", "osmium-")
@@ -179,31 +238,10 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return 0, err
 	}
-	alias := "osmium-" + o.HostID
-	if len(hostCAs) > 0 {
-		// When verifying a Host Certificate, OpenSSH checks the HostKeyAlias
-		// against the certificate's principals.
-		alias = o.HostID
-		if len(ready.HostCertPrincipals) > 0 && ready.HostCertPrincipals[0] != "" {
-			alias = ready.HostCertPrincipals[0]
-		}
-	}
-	var kh strings.Builder
-	for _, k := range hostKeys {
-		kh.WriteString(alias + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k))) + "\n")
-	}
-	if len(hostCAs) > 0 {
-		principals := alias
-		if len(ready.HostCertPrincipals) > 0 {
-			principals = strings.Join(ready.HostCertPrincipals, ",")
-		}
-		for _, caKey := range hostCAs {
-			kh.WriteString("@cert-authority " + principals + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(caKey))) + "\n")
-		}
-	}
+	alias, khContent := formatKnownHosts(o.HostID, hostKeys, hostCAs, ready.HostCertPrincipals)
 	khPath := filepath.Join(dir, "known_hosts")
 	certPath := filepath.Join(dir, "id-cert.pub")
-	if err := os.WriteFile(khPath, []byte(kh.String()), 0o600); err != nil {
+	if err := os.WriteFile(khPath, []byte(khContent), 0o600); err != nil {
 		return 0, err
 	}
 	if err := os.WriteFile(certPath, ssh.MarshalAuthorizedKey(cert), 0o600); err != nil {
@@ -268,7 +306,7 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 		"-o", "ProxyCommand="+sshToken(strings.Join(proxy, " ")),
 		"-o", "HostKeyAlias="+alias,
 		"-o", "UserKnownHostsFile="+sshToken(khPath),
-		"-o", "GlobalKnownHostsFile=/dev/null",
+		"-o", "GlobalKnownHostsFile="+nullKnownHostsPath(),
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UpdateHostKeys=no",
 		"-o", "CheckHostIP=no",
@@ -313,6 +351,127 @@ func (a *API) SSH(ctx context.Context, o SSHOptions) (int, error) {
 	if reason != "" && reason != "client_closed" && reason != "remote_closed" {
 		fmt.Fprintf(o.Stderr, "osmium: session ended: %s\n", reason)
 	}
+	var ee *exec.ExitError
+	if errors.As(runErr, &ee) {
+		return ee.ExitCode(), nil
+	}
+	if runErr != nil {
+		return 0, runErr
+	}
+	return 0, nil
+}
+
+// sshDirect connects directly to an agentless sshd using a single-host short-lived
+// certificate issued by POST /api/v1/direct-certs (no ProxyCommand or relay).
+func (a *API) sshDirect(ctx context.Context, o SSHOptions, sshPath, login string, logf func(string, ...any)) (int, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return 0, err
+	}
+	defer clear(priv)
+	sshPub, _ := ssh.NewPublicKey(pub)
+
+	resp, err := a.IssueDirectCert(ctx, DirectCertRequest{
+		Mode:      "host",
+		HostID:    o.HostID,
+		LoginUser: login,
+		PublicKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))),
+	})
+	if err != nil {
+		return 0, err
+	}
+	certKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(resp.Certificate))
+	cert, ok := certKey.(*ssh.Certificate)
+	if err != nil || !ok || string(cert.Key.Marshal()) != string(sshPub.Marshal()) {
+		return 0, errors.New("server returned a certificate for a different key")
+	}
+	targetHost, targetPort, err := net.SplitHostPort(resp.SSHAddress)
+	if err != nil {
+		return 0, fmt.Errorf("server returned invalid ssh_address %q: %w", resp.SSHAddress, err)
+	}
+	hostKeys, hostCAs, err := parseHostTrust(resp.HostKeys, resp.HostCAs)
+	if err != nil {
+		return 0, err
+	}
+	logf("direct cert %s issued for %s (%s), valid until %s", resp.CertID, resp.SSHAddress, strings.Join(resp.Principals, ","), resp.ValidBefore.Local().Format(time.RFC3339))
+
+	dir, err := os.MkdirTemp("", "osmium-direct-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return 0, err
+	}
+	alias, khContent := formatKnownHosts(o.HostID, hostKeys, hostCAs, resp.HostCertPrincipals)
+	khPath := filepath.Join(dir, "known_hosts")
+	certPath := filepath.Join(dir, "id-cert.pub")
+	if err := os.WriteFile(khPath, []byte(khContent), 0o600); err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(certPath, ssh.MarshalAuthorizedKey(cert), 0o600); err != nil {
+		return 0, err
+	}
+
+	args := []string{"-p", targetPort}
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if !o.NoAgent && sock != "" {
+		ac, err := net.Dial("unix", sock)
+		if err != nil {
+			return 0, fmt.Errorf("ssh-agent: %w (use --no-agent to skip)", err)
+		}
+		defer ac.Close()
+		ag := agent.NewClient(ac)
+		life := time.Until(time.Unix(int64(cert.ValidBefore), 0)) + 30*time.Second
+		life = min(max(life, time.Minute), 10*time.Minute)
+		for _, k := range []agent.AddedKey{
+			{PrivateKey: priv, LifetimeSecs: uint32(life.Seconds()), Comment: "osmium " + resp.CertID},
+			{PrivateKey: priv, Certificate: cert, LifetimeSecs: uint32(life.Seconds()), Comment: "osmium " + resp.CertID},
+		} {
+			if err := ag.Add(k); err != nil {
+				_ = ag.Remove(sshPub)
+				return 0, fmt.Errorf("ssh-agent: add key: %w (use --no-agent to skip)", err)
+			}
+		}
+		defer func() { _ = ag.Remove(cert); _ = ag.Remove(sshPub) }()
+		pubPath := filepath.Join(dir, "id.pub")
+		if err := os.WriteFile(pubPath, ssh.MarshalAuthorizedKey(sshPub), 0o600); err != nil {
+			return 0, err
+		}
+		args = append(args, "-o", "IdentityFile="+sshToken(filepath.Join(dir, "id")))
+		logf("certificate loaded into ssh-agent for %s", life.Round(time.Second))
+	} else {
+		block, err := ssh.MarshalPrivateKey(priv, "")
+		if err != nil {
+			return 0, err
+		}
+		keyPath := filepath.Join(dir, "id")
+		if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600); err != nil {
+			return 0, err
+		}
+		args = append(args, "-o", "IdentityAgent=none", "-o", "IdentityFile="+sshToken(keyPath))
+	}
+
+	args = append(args,
+		"-o", "HostKeyAlias="+alias,
+		"-o", "UserKnownHostsFile="+sshToken(khPath),
+		"-o", "GlobalKnownHostsFile="+nullKnownHostsPath(),
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UpdateHostKeys=no",
+		"-o", "CheckHostIP=no",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "CertificateFile="+sshToken(certPath),
+		"-o", "PasswordAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+		"-l", login, targetHost,
+	)
+	args = append(args, o.Args...)
+
+	cmd := exec.CommandContext(ctx, sshPath, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = o.Stdin, o.Stdout, o.Stderr
+	runErr := cmd.Run()
 	var ee *exec.ExitError
 	if errors.As(runErr, &ee) {
 		return ee.ExitCode(), nil

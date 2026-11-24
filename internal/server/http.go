@@ -34,6 +34,7 @@ type Server struct {
 	Store    *authz.Store
 	Hub      *agenthub.Hub
 	Sessions *sessions.Manager
+	Direct   *DirectCertIssuer
 	Auth     *authn.Authenticator
 	Audit    *audit.Logger
 	Log      *slog.Logger
@@ -55,6 +56,8 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("POST /auth/cli/token", s.Auth.HandleCLIToken)
 	mux.HandleFunc("POST /api/v1/cli/logout", s.authed(s.cliLogout))
 	mux.HandleFunc("POST /api/v1/native-sessions", s.authed(s.createNative))
+	mux.HandleFunc("POST /api/v1/direct-certs", s.authed(s.issueDirectCert))
+	mux.HandleFunc("GET /api/v1/host-cas", s.authed(s.hostCAs))
 	mux.HandleFunc("GET /api/v1/ssh-sessions/{session_id}/tunnel", s.authed(s.nativeTunnel))
 	mux.HandleFunc("GET /api/v1/me", s.authed(s.me))
 	mux.HandleFunc("GET /api/v1/hosts", s.authed(s.listHosts))
@@ -72,6 +75,9 @@ func (s *Server) WebHandler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/admin/hosts/{host_id}", s.authed(s.csrf(s.adminDeleteHost)))
 	mux.HandleFunc("PUT /api/v1/admin/grants/{grant_id}", s.authed(s.csrf(s.adminUpsertGrant)))
 	mux.HandleFunc("DELETE /api/v1/admin/grants/{grant_id}", s.authed(s.csrf(s.adminDeleteGrant)))
+	mux.HandleFunc("GET /api/v1/admin/cert-roles", s.authed(s.adminListCertRoles))
+	mux.HandleFunc("PUT /api/v1/admin/cert-roles/{role_id}", s.authed(s.csrf(s.adminUpsertCertRole)))
+	mux.HandleFunc("DELETE /api/v1/admin/cert-roles/{role_id}", s.authed(s.csrf(s.adminDeleteCertRole)))
 	mux.HandleFunc("PUT /api/v1/admin/host-cas", s.authed(s.csrf(s.adminSetHostCAs)))
 	return securityHeaders(mux)
 }
@@ -212,6 +218,8 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 type hostView struct {
 	ID                string            `json:"id"`
 	DisplayName       string            `json:"display_name"`
+	ConnectionMode    string            `json:"connection_mode"`
+	SSHAddress        string            `json:"ssh_address,omitempty"`
 	Status            string            `json:"status"`
 	PolicyLabels      map[string]string `json:"policy_labels"`
 	AllowedLoginUsers []string          `json:"allowed_login_users"`
@@ -267,9 +275,9 @@ func (s *Server) listHosts(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 	}
 	statusFilter := strings.TrimSpace(q.Get("status"))
 	switch statusFilter {
-	case "", "ready", "offline", "disabled":
+	case "", "ready", "direct", "offline", "disabled":
 	default:
-		writeError(w, r, http.StatusBadRequest, "INVALID_FILTER", "status must be ready, offline or disabled")
+		writeError(w, r, http.StatusBadRequest, "INVALID_FILTER", "status must be ready, direct, offline or disabled")
 		return
 	}
 	limit := 50
@@ -307,6 +315,8 @@ func (s *Server) listHosts(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 		items = append(items, hostView{
 			ID:                h.ID,
 			DisplayName:       h.DisplayName,
+			ConnectionMode:    h.EffectiveMode(),
+			SSHAddress:        h.SSHAddress,
 			Status:            entry.Status,
 			PolicyLabels:      h.PolicyLabels,
 			AllowedLoginUsers: entry.AllowedLogins,

@@ -271,6 +271,14 @@ body {
   background: var(--ok);
 }
 
+.host-status--direct {
+  color: var(--info);
+}
+
+.host-status--direct .host-status__dot {
+  background: var(--info);
+}
+
 .host-status--connecting {
   color: var(--warn);
 }

@@ -88,8 +88,8 @@ CREATE TABLE IF NOT EXISTS policy_meta (
 CREATE TABLE IF NOT EXISTS hosts (
 	id TEXT PRIMARY KEY,
 	display_name TEXT NOT NULL,
-	agent_id TEXT NOT NULL UNIQUE,
-	client_cert_cn TEXT NOT NULL UNIQUE,
+	agent_id TEXT UNIQUE,
+	client_cert_cn TEXT UNIQUE,
 	disabled INTEGER NOT NULL DEFAULT 0,
 	doc_json TEXT NOT NULL
 );
@@ -104,6 +104,12 @@ CREATE TABLE IF NOT EXISTS host_labels (
 CREATE INDEX IF NOT EXISTS idx_host_labels_kv ON host_labels(k, v, host_id);
 
 CREATE TABLE IF NOT EXISTS grants (
+	id TEXT PRIMARY KEY,
+	ord INTEGER NOT NULL,
+	doc_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cert_roles (
 	id TEXT PRIMARY KEY,
 	ord INTEGER NOT NULL,
 	doc_json TEXT NOT NULL
@@ -148,8 +154,69 @@ CREATE INDEX IF NOT EXISTS idx_audit_target_ts ON audit_events(target, ts_ns, se
 `
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.wdb.Exec(schema)
-	return err
+	if _, err := s.wdb.Exec(schema); err != nil {
+		return err
+	}
+	return s.migrateNullableHostAgentLocked()
+}
+
+// migrateNullableHostAgentLocked upgrades legacy databases whose hosts table
+// had NOT NULL on agent_id/client_cert_cn so agentless direct hosts can be stored.
+func (s *SQLiteStore) migrateNullableHostAgentLocked() error {
+	rows, err := s.wdb.Query(`PRAGMA table_info(hosts)`)
+	if err != nil {
+		return err
+	}
+	needsUpgrade := false
+	for rows.Next() {
+		var (
+			cid        int
+			name, ctyp string
+			notNull    int
+			dflt       sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &ctyp, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if (name == "agent_id" || name == "client_cert_cn") && notNull != 0 {
+			needsUpgrade = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !needsUpgrade {
+		return nil
+	}
+	if _, err := s.wdb.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer func() { _, _ = s.wdb.Exec(`PRAGMA foreign_keys = ON`) }()
+	tx, err := s.wdb.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	const upgradeSQL = `
+CREATE TABLE hosts_new (
+	id TEXT PRIMARY KEY,
+	display_name TEXT NOT NULL,
+	agent_id TEXT UNIQUE,
+	client_cert_cn TEXT UNIQUE,
+	disabled INTEGER NOT NULL DEFAULT 0,
+	doc_json TEXT NOT NULL
+);
+INSERT INTO hosts_new (id, display_name, agent_id, client_cert_cn, disabled, doc_json)
+SELECT id, display_name, NULLIF(agent_id, ''), NULLIF(client_cert_cn, ''), disabled, doc_json FROM hosts;
+DROP TABLE hosts;
+ALTER TABLE hosts_new RENAME TO hosts;
+`
+	if _, err := tx.Exec(upgradeSQL); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // HasPolicy reports whether the database already contains a persisted policy.
@@ -238,6 +305,26 @@ func (s *SQLiteStore) LoadDocument() (authz.Document, bool, error) {
 	if err := gRows.Err(); err != nil {
 		return doc, false, err
 	}
+
+	rRows, err := s.rdb.Query(`SELECT doc_json FROM cert_roles ORDER BY ord ASC, id ASC`)
+	if err != nil {
+		return doc, false, err
+	}
+	defer rRows.Close()
+	for rRows.Next() {
+		var raw string
+		if err := rRows.Scan(&raw); err != nil {
+			return doc, false, err
+		}
+		var r authz.CertRole
+		if err := json.Unmarshal([]byte(raw), &r); err != nil {
+			return doc, false, err
+		}
+		doc.CertRoles = append(doc.CertRoles, r)
+	}
+	if err := rRows.Err(); err != nil {
+		return doc, false, err
+	}
 	return doc, true, nil
 }
 
@@ -287,8 +374,11 @@ func (s *SQLiteStore) SaveDocument(doc authz.Document) error {
 	if _, err := tx.Exec(`DELETE FROM grants`); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM cert_roles`); err != nil {
+		return err
+	}
 
-	hostStmt, err := tx.Prepare(`INSERT INTO hosts(id, display_name, agent_id, client_cert_cn, disabled, doc_json) VALUES(?, ?, ?, ?, ?, ?)`)
+	hostStmt, err := tx.Prepare(`INSERT INTO hosts(id, display_name, agent_id, client_cert_cn, disabled, doc_json) VALUES(?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -336,6 +426,21 @@ func (s *SQLiteStore) SaveDocument(doc authz.Document) error {
 			return err
 		}
 	}
+
+	roleStmt, err := tx.Prepare(`INSERT INTO cert_roles(id, ord, doc_json) VALUES(?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer roleStmt.Close()
+	for i, r := range doc.CertRoles {
+		raw, err := json.Marshal(r)
+		if err != nil {
+			return err
+		}
+		if _, err := roleStmt.Exec(r.ID, i, string(raw)); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -356,7 +461,7 @@ func (s *SQLiteStore) UpsertHost(h *authz.Host) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO hosts(id, display_name, agent_id, client_cert_cn, disabled, doc_json) VALUES(?, ?, ?, ?, ?, ?)
+	if _, err := tx.Exec(`INSERT INTO hosts(id, display_name, agent_id, client_cert_cn, disabled, doc_json) VALUES(?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?)
 		ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, agent_id=excluded.agent_id, client_cert_cn=excluded.client_cert_cn, disabled=excluded.disabled, doc_json=excluded.doc_json`,
 		h.ID, h.DisplayName, h.Agent.ID, h.Agent.ClientCertCN, dis, string(raw)); err != nil {
 		return err
@@ -398,6 +503,27 @@ func (s *SQLiteStore) DeleteGrant(grantID string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.wdb.Exec(`DELETE FROM grants WHERE id = ?`, grantID)
+	return err
+}
+
+// UpsertCertRole persists a single direct cert role.
+func (s *SQLiteStore) UpsertCertRole(r authz.CertRole) error {
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.wdb.Exec(`INSERT INTO cert_roles(id, ord, doc_json) VALUES(?, COALESCE((SELECT ord FROM cert_roles WHERE id = ?), COALESCE((SELECT MAX(ord)+1 FROM cert_roles), 0)), ?)
+		ON CONFLICT(id) DO UPDATE SET doc_json=excluded.doc_json`, r.ID, r.ID, string(raw))
+	return err
+}
+
+// DeleteCertRole removes one direct cert role by ID.
+func (s *SQLiteStore) DeleteCertRole(roleID string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.wdb.Exec(`DELETE FROM cert_roles WHERE id = ?`, roleID)
 	return err
 }
 
